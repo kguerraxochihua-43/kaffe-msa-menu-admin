@@ -1,0 +1,473 @@
+{
+  "info": {
+    "_postman_id": "d6f9b919-0000-4000-8000-menuadminv2",
+    "name": "Kaffe MSA Menu Admin",
+    "description": "CRUD administrativo de menus, categorias, productos, extras, grupos de extras y disponibilidad/asignacion por sucursal.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "protocolProfileBehavior": {
+    "disableCookies": true
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.request.headers.remove('Cookie');",
+          "pm.request.headers.remove('cookie');",
+          "const token = pm.environment.get('token') || pm.globals.get('token') || pm.collectionVariables.get('token');",
+          "if (token) {",
+          "  pm.request.headers.upsert({ key: 'Authorization', value: `Bearer ${token}` });",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health text",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "auth": { "type": "noauth" }
+          },
+          "response": []
+        },
+        {
+          "name": "Health JSON",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{baseUrl}}/health/json",
+              "host": ["{{baseUrl}}"],
+              "path": ["health", "json"]
+            },
+            "auth": { "type": "noauth" }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Menus",
+      "item": [
+        {
+          "name": "List menus",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/menus",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "menus"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create global menu",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const json = pm.response.json();",
+                  "if (json.data?.menuId) pm.environment.set('menuId', json.data.menuId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Menu Principal\",\n  \"description\": \"Menu base disponible para todas las sucursales.\",\n  \"global\": true,\n  \"active\": true,\n  \"sortOrder\": 1\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/menus",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "menus"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create menu assigned to selected locations",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const json = pm.response.json();",
+                  "if (json.data?.menuId) pm.environment.set('menuId', json.data.menuId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Menu Sucursal Centro\",\n  \"description\": \"Menu especifico para sucursales seleccionadas.\",\n  \"global\": false,\n  \"locationIds\": [{{locationId}}],\n  \"active\": true,\n  \"sortOrder\": 2\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/menus",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "menus"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get menu",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/menus/{{menuId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "menus", "{{menuId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update menu locations",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"global\": false,\n  \"locationIds\": [{{locationId}}]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/menus/{{menuId}}/locations",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "menus", "{{menuId}}", "locations"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Delete menu",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/menus/{{menuId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "menus", "{{menuId}}"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Categories",
+      "item": [
+        {
+          "name": "List categories",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/categories",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "categories"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create category",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const json = pm.response.json();",
+                  "if (json.data?.categoryId) pm.environment.set('categoryId', json.data.categoryId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Cafe\",\n  \"description\": \"Bebidas calientes y de espresso.\",\n  \"sortOrder\": 1,\n  \"active\": true,\n  \"menuIds\": [{{menuId}}]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/categories",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "categories"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update category",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"description\": \"Bebidas calientes, espresso y filtrados.\",\n  \"sortOrder\": 2,\n  \"active\": true\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/categories/{{categoryId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "categories", "{{categoryId}}"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Products",
+      "item": [
+        {
+          "name": "List products",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/products",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "products"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create product",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const json = pm.response.json();",
+                  "if (json.data?.productId) pm.environment.set('productId', json.data.productId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"categoryId\": {{categoryId}},\n  \"name\": \"Latte\",\n  \"description\": \"Espresso con leche texturizada.\",\n  \"basePrice\": 5900,\n  \"imageUrl\": null,\n  \"featured\": true,\n  \"available\": true,\n  \"sortOrder\": 1,\n  \"locationIds\": [{{locationId}}]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/products",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "products"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get product",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "application/json" }],
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/products/{{productId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "products", "{{productId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Assign product to selected locations",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"locationIds\": [{{locationId}}],\n  \"priceOverride\": 6500,\n  \"available\": true,\n  \"featured\": true,\n  \"sortOrder\": 1\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/products/{{productId}}/locations",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "products", "{{productId}}", "locations"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Addon groups and addons",
+      "item": [
+        {
+          "name": "Create addon group",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const json = pm.response.json();",
+                  "if (json.data?.addonGroupId) pm.environment.set('addonGroupId', json.data.addonGroupId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Leches\",\n  \"description\": \"Tipos de leche disponibles.\",\n  \"required\": false,\n  \"minSelection\": 0,\n  \"maxSelection\": 1,\n  \"sortOrder\": 1,\n  \"active\": true\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/addon-groups",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "addon-groups"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create addon",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const json = pm.response.json();",
+                  "if (json.data?.addonId) pm.environment.set('addonId', json.data.addonId);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Leche de avena\",\n  \"description\": \"Extra de leche vegetal.\",\n  \"price\": 1000,\n  \"sortOrder\": 1,\n  \"active\": true\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/addon-groups/{{addonGroupId}}/addons",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "addon-groups", "{{addonGroupId}}", "addons"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Attach addon group to product",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"addonGroupId\": {{addonGroupId}},\n  \"required\": false,\n  \"minSelection\": 0,\n  \"maxSelection\": 1,\n  \"sortOrder\": 1\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/products/{{productId}}/addon-groups",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "products", "{{productId}}", "addon-groups"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Configure addon by location",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"available\": true,\n  \"priceOverride\": 1200\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/menu-admin/cafeterias/{{cafeteriaId}}/locations/{{locationId}}/addons/{{addonId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "menu-admin", "cafeterias", "{{cafeteriaId}}", "locations", "{{locationId}}", "addons", "{{addonId}}"]
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8086", "type": "string" },
+    { "key": "token", "value": "", "type": "string" },
+    { "key": "cafeteriaId", "value": "5", "type": "string" },
+    { "key": "locationId", "value": "6", "type": "string" },
+    { "key": "menuId", "value": "1", "type": "string" },
+    { "key": "categoryId", "value": "1", "type": "string" },
+    { "key": "productId", "value": "1", "type": "string" },
+    { "key": "addonGroupId", "value": "1", "type": "string" },
+    { "key": "addonId", "value": "1", "type": "string" }
+  ]
+}

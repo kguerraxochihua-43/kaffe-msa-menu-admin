@@ -1,0 +1,39 @@
+target/
+.DS_Store
+
+# IntelliJ / JetBrains
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# VS Code
+.vscode/
+
+# Maven / Java build artifacts
+*.class
+*.log
+*.ctxt
+.mtj.tmp/
+
+# Package files
+*.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# Local environment and sensitive files
+.env
+.env.*
+wallet/
+*.p12
+*.jks
+*.sso
+*.pem
+
+# OS generated files
+Thumbs.db
+~$*
