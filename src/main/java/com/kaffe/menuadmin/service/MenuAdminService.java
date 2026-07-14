@@ -3,6 +3,12 @@ package com.kaffe.menuadmin.service;
 import com.kaffe.common.exception.BadRequestException;
 import com.kaffe.common.exception.ForbiddenException;
 import com.kaffe.common.exception.ResourceNotFoundException;
+import com.kaffe.common.media.MediaAsset;
+import com.kaffe.common.media.MediaAssetService;
+import com.kaffe.common.media.MediaCompleteRequest;
+import com.kaffe.common.media.MediaUploadPolicy;
+import com.kaffe.common.media.MediaUploadRequest;
+import com.kaffe.common.media.PresignedMediaUpload;
 import com.kaffe.common.security.CurrentUserProvider;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.EmptyResultDataAccessException;
@@ -10,26 +16,357 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
 public class MenuAdminService {
 
-    private static final List<String> MANAGER_ROLES = List.of("owner", "admin");
+    private static final List<String> MANAGER_ROLES = List.of(
+            "owner", "multi_location_owner", "admin", "manager", "location_manager"
+    );
+    private static final String PURPOSE_MENU_PRODUCT_IMAGE = "menu-product-image";
 
     private final JdbcTemplate jdbcTemplate;
     private final CurrentUserProvider currentUserProvider;
+    private final MediaAssetService mediaAssetService;
 
     @org.springframework.beans.factory.annotation.Value("${kaffe.auth.schema:kaffe_auth}")
     private String authSchema = "auth";
+
+    public Map<String, Object> getMenuSettings(Long cafeteriaId) {
+        requireTenantAccess(cafeteriaId, false);
+        ensureDefaultMenuSettings(cafeteriaId);
+        return findMenuSettings(cafeteriaId);
+    }
+
+    @Transactional
+    public Map<String, Object> updateMenuSettings(Long cafeteriaId, Map<String, Object> request) {
+        requireTenantAccess(cafeteriaId, true);
+        ensureDefaultMenuSettings(cafeteriaId);
+
+        String defaultLanguageCode = normalizeLanguageCode(stringOrNull(request.get("defaultLanguageCode")));
+        String baseCurrencyCode = normalizeCurrencyCode(stringOrNull(request.get("baseCurrencyCode")));
+        Boolean allowExchangeConversion = nullableBoolean(request.get("allowExchangeConversion"));
+
+        if (defaultLanguageCode != null) {
+            upsertLanguage(cafeteriaId, defaultLanguageCode, row(
+                    "displayName", request.getOrDefault("defaultLanguageName", defaultLanguageCode),
+                    "default", true,
+                    "active", true
+            ));
+        }
+        if (baseCurrencyCode != null) {
+            upsertCurrency(cafeteriaId, baseCurrencyCode, row(
+                    "displayName", request.getOrDefault("baseCurrencyName", baseCurrencyCode),
+                    "symbol", request.get("baseCurrencySymbol"),
+                    "base", true,
+                    "active", true
+            ));
+        }
+
+        jdbcTemplate.update("""
+                        insert into menu.tenant_menu_settings (
+                            tenant_id, default_language_code, base_currency_code, allow_exchange_conversion
+                        )
+                        values (?, coalesce(?, 'es'), coalesce(?, 'MXN'), coalesce(?, true))
+                        on conflict (tenant_id) do update set
+                            default_language_code = coalesce(excluded.default_language_code, menu.tenant_menu_settings.default_language_code),
+                            base_currency_code = coalesce(excluded.base_currency_code, menu.tenant_menu_settings.base_currency_code),
+                            allow_exchange_conversion = coalesce(excluded.allow_exchange_conversion, menu.tenant_menu_settings.allow_exchange_conversion),
+                            updated_at = now()
+                        """,
+                cafeteriaId,
+                defaultLanguageCode,
+                baseCurrencyCode,
+                allowExchangeConversion);
+        return findMenuSettings(cafeteriaId);
+    }
+
+    public List<Map<String, Object>> listLanguages(Long cafeteriaId) {
+        requireTenantAccess(cafeteriaId, false);
+        ensureDefaultMenuSettings(cafeteriaId);
+        return jdbcTemplate.query("""
+                        select *
+                        from menu.tenant_supported_languages
+                        where tenant_id = ?
+                          and deleted_at is null
+                        order by is_default desc, sort_order asc, language_code asc
+                        """,
+                (rs, rowNum) -> languageRow(rs),
+                cafeteriaId);
+    }
+
+    @Transactional
+    public Map<String, Object> upsertLanguageConfig(Long cafeteriaId, String languageCode, Map<String, Object> request) {
+        requireTenantAccess(cafeteriaId, true);
+        ensureDefaultMenuSettings(cafeteriaId);
+        String normalizedLanguageCode = normalizeLanguageCode(languageCode);
+        upsertLanguage(cafeteriaId, normalizedLanguageCode, request);
+        if (booleanValue(request.getOrDefault("default", false))) {
+            jdbcTemplate.update("""
+                            update menu.tenant_menu_settings
+                            set default_language_code = ?,
+                                updated_at = now()
+                            where tenant_id = ?
+                            """,
+                    normalizedLanguageCode,
+                    cafeteriaId);
+        }
+        return findLanguage(cafeteriaId, normalizedLanguageCode);
+    }
+
+    @Transactional
+    public void softDeleteLanguage(Long cafeteriaId, String languageCode) {
+        Long userId = requireTenantAccess(cafeteriaId, true).userId();
+        String normalizedLanguageCode = normalizeLanguageCode(languageCode);
+        if (normalizedLanguageCode == null) {
+            throw new BadRequestException("languageCode is required");
+        }
+        Map<String, Object> language = findLanguage(cafeteriaId, normalizedLanguageCode);
+        if (Boolean.TRUE.equals(language.get("default"))) {
+            throw new BadRequestException("Default language cannot be deleted");
+        }
+        int updated = jdbcTemplate.update("""
+                        update menu.tenant_supported_languages
+                        set is_active = false,
+                            deleted_at = now(),
+                            deleted_by_user_id = ?,
+                            updated_at = now()
+                        where tenant_id = ?
+                          and language_code = ?
+                          and deleted_at is null
+                        """,
+                userId,
+                cafeteriaId,
+                normalizedLanguageCode);
+        if (updated == 0) {
+            throw new ResourceNotFoundException("Language was not found for this cafeteria");
+        }
+    }
+
+    public List<Map<String, Object>> listCurrencies(Long cafeteriaId) {
+        requireTenantAccess(cafeteriaId, false);
+        ensureDefaultMenuSettings(cafeteriaId);
+        return jdbcTemplate.query("""
+                        select *
+                        from menu.tenant_supported_currencies
+                        where tenant_id = ?
+                          and deleted_at is null
+                        order by is_base desc, sort_order asc, currency_code asc
+                        """,
+                (rs, rowNum) -> currencyRow(rs),
+                cafeteriaId);
+    }
+
+    @Transactional
+    public Map<String, Object> upsertCurrency(Long cafeteriaId, String currencyCode, Map<String, Object> request) {
+        requireTenantAccess(cafeteriaId, true);
+        ensureDefaultMenuSettings(cafeteriaId);
+        String normalizedCurrencyCode = normalizeCurrencyCode(currencyCode);
+        if (normalizedCurrencyCode == null) {
+            throw new BadRequestException("currencyCode is required");
+        }
+        boolean base = booleanValue(request.getOrDefault("base", false));
+        if (base) {
+            jdbcTemplate.update("""
+                            update menu.tenant_supported_currencies
+                            set is_base = false,
+                                updated_at = now()
+                            where tenant_id = ?
+                              and deleted_at is null
+                            """,
+                    cafeteriaId);
+        }
+        jdbcTemplate.update("""
+                        insert into menu.tenant_supported_currencies (
+                            tenant_id, currency_code, display_name, symbol, is_base, is_active, sort_order,
+                            deleted_at, deleted_by_user_id
+                        )
+                        values (?, ?, ?, ?, ?, ?, ?, null, null)
+                        on conflict (tenant_id, currency_code) do update set
+                            display_name = excluded.display_name,
+                            symbol = excluded.symbol,
+                            is_base = excluded.is_base,
+                            is_active = excluded.is_active,
+                            sort_order = excluded.sort_order,
+                            deleted_at = null,
+                            deleted_by_user_id = null,
+                            updated_at = now()
+                        """,
+                cafeteriaId,
+                normalizedCurrencyCode,
+                stringOrNull(request.get("displayName")) == null ? normalizedCurrencyCode : stringOrNull(request.get("displayName")),
+                stringOrNull(request.get("symbol")),
+                base,
+                booleanValue(request.getOrDefault("active", true)),
+                intValue(request.getOrDefault("sortOrder", 0)));
+        if (base) {
+            jdbcTemplate.update("""
+                            update menu.tenant_menu_settings
+                            set base_currency_code = ?,
+                                updated_at = now()
+                            where tenant_id = ?
+                            """,
+                    normalizedCurrencyCode,
+                    cafeteriaId);
+        }
+        return findCurrency(cafeteriaId, normalizedCurrencyCode);
+    }
+
+    @Transactional
+    public void softDeleteCurrency(Long cafeteriaId, String currencyCode) {
+        Long userId = requireTenantAccess(cafeteriaId, true).userId();
+        String normalizedCurrencyCode = normalizeCurrencyCode(currencyCode);
+        if (normalizedCurrencyCode == null) {
+            throw new BadRequestException("currencyCode is required");
+        }
+        Map<String, Object> currency = findCurrency(cafeteriaId, normalizedCurrencyCode);
+        if (Boolean.TRUE.equals(currency.get("base"))) {
+            throw new BadRequestException("Base currency cannot be deleted");
+        }
+        int updated = jdbcTemplate.update("""
+                        update menu.tenant_supported_currencies
+                        set is_active = false,
+                            deleted_at = now(),
+                            deleted_by_user_id = ?,
+                            updated_at = now()
+                        where tenant_id = ?
+                          and currency_code = ?
+                          and deleted_at is null
+                        """,
+                userId,
+                cafeteriaId,
+                normalizedCurrencyCode);
+        if (updated == 0) {
+            throw new ResourceNotFoundException("Currency was not found for this cafeteria");
+        }
+    }
+
+    public List<Map<String, Object>> listExchangeRates(Long cafeteriaId) {
+        requireTenantAccess(cafeteriaId, false);
+        ensureDefaultMenuSettings(cafeteriaId);
+        return jdbcTemplate.query("""
+                        select *
+                        from menu.tenant_exchange_rates
+                        where tenant_id = ?
+                          and deleted_at is null
+                        order by is_active desc, from_currency_code asc, to_currency_code asc, effective_from desc
+                        """,
+                (rs, rowNum) -> exchangeRateRow(rs),
+                cafeteriaId);
+    }
+
+    @Transactional
+    public Map<String, Object> createExchangeRate(Long cafeteriaId, Map<String, Object> request) {
+        requireTenantAccess(cafeteriaId, true);
+        ensureDefaultMenuSettings(cafeteriaId);
+        String fromCurrencyCode = normalizeCurrencyCode(requiredString(request, "fromCurrencyCode"));
+        String toCurrencyCode = normalizeCurrencyCode(requiredString(request, "toCurrencyCode"));
+        validateCurrencyPair(cafeteriaId, fromCurrencyCode, toCurrencyCode);
+        boolean active = booleanValue(request.getOrDefault("active", true));
+        OffsetDateTime effectiveTo = nullableOffsetDateTime(request.get("effectiveTo"));
+        if (active && effectiveTo == null) {
+            deactivateActiveExchangeRatePair(cafeteriaId, fromCurrencyCode, toCurrencyCode, null);
+        }
+        Long exchangeRateId = jdbcTemplate.queryForObject("""
+                        insert into menu.tenant_exchange_rates (
+                            tenant_id, from_currency_code, to_currency_code, rate, effective_from,
+                            effective_to, is_active, notes
+                        )
+                        values (?, ?, ?, ?, coalesce(cast(? as timestamp with time zone), now()), cast(? as timestamp with time zone), ?, ?)
+                        returning exchange_rate_id
+                        """,
+                Long.class,
+                cafeteriaId,
+                fromCurrencyCode,
+                toCurrencyCode,
+                decimalValue(request.get("rate")),
+                nullableOffsetDateTime(request.get("effectiveFrom")),
+                effectiveTo,
+                active,
+                stringOrNull(request.get("notes")));
+        return findExchangeRate(cafeteriaId, exchangeRateId);
+    }
+
+    @Transactional
+    public Map<String, Object> updateExchangeRate(Long cafeteriaId, Long exchangeRateId, Map<String, Object> request) {
+        requireTenantAccess(cafeteriaId, true);
+        Map<String, Object> current = findExchangeRate(cafeteriaId, exchangeRateId);
+        String fromCurrencyCode = normalizeCurrencyCode(stringOrNull(request.get("fromCurrencyCode")));
+        String toCurrencyCode = normalizeCurrencyCode(stringOrNull(request.get("toCurrencyCode")));
+        if (fromCurrencyCode == null) {
+            fromCurrencyCode = String.valueOf(current.get("fromCurrencyCode"));
+        }
+        if (toCurrencyCode == null) {
+            toCurrencyCode = String.valueOf(current.get("toCurrencyCode"));
+        }
+        validateCurrencyPair(cafeteriaId, fromCurrencyCode, toCurrencyCode);
+        Boolean active = nullableBoolean(request.get("active"));
+        OffsetDateTime effectiveTo = request.containsKey("effectiveTo")
+                ? nullableOffsetDateTime(request.get("effectiveTo"))
+                : (OffsetDateTime) current.get("effectiveTo");
+        boolean willBeActive = active == null ? Boolean.TRUE.equals(current.get("active")) : active;
+        if (willBeActive && effectiveTo == null) {
+            deactivateActiveExchangeRatePair(cafeteriaId, fromCurrencyCode, toCurrencyCode, exchangeRateId);
+        }
+        jdbcTemplate.update("""
+                        update menu.tenant_exchange_rates
+                        set from_currency_code = ?,
+                            to_currency_code = ?,
+                            rate = coalesce(?, rate),
+                            effective_from = coalesce(cast(? as timestamp with time zone), effective_from),
+                            effective_to = cast(? as timestamp with time zone),
+                            is_active = coalesce(?, is_active),
+                            notes = coalesce(?, notes),
+                            updated_at = now()
+                        where tenant_id = ?
+                          and exchange_rate_id = ?
+                          and deleted_at is null
+                        """,
+                fromCurrencyCode,
+                toCurrencyCode,
+                nullableBigDecimal(request.get("rate")),
+                nullableOffsetDateTime(request.get("effectiveFrom")),
+                effectiveTo,
+                active,
+                stringOrNull(request.get("notes")),
+                cafeteriaId,
+                exchangeRateId);
+        return findExchangeRate(cafeteriaId, exchangeRateId);
+    }
+
+    @Transactional
+    public void softDeleteExchangeRate(Long cafeteriaId, Long exchangeRateId) {
+        Long userId = requireTenantAccess(cafeteriaId, true).userId();
+        int updated = jdbcTemplate.update("""
+                        update menu.tenant_exchange_rates
+                        set is_active = false,
+                            deleted_at = now(),
+                            deleted_by_user_id = ?,
+                            updated_at = now()
+                        where tenant_id = ?
+                          and exchange_rate_id = ?
+                          and deleted_at is null
+                        """,
+                userId,
+                cafeteriaId,
+                exchangeRateId);
+        if (updated == 0) {
+            throw new ResourceNotFoundException("Exchange rate was not found for this cafeteria");
+        }
+    }
 
     public List<Map<String, Object>> listMenus(Long cafeteriaId) {
         requireTenantAccess(cafeteriaId, false);
@@ -239,6 +576,26 @@ public class MenuAdminService {
                 categoryId);
     }
 
+    public List<Map<String, Object>> listCategoryTranslations(Long cafeteriaId, Long categoryId) {
+        requireTenantAccess(cafeteriaId, false);
+        ensureCategory(cafeteriaId, categoryId);
+        return listTranslations(cafeteriaId, "menu.category_translations", "category_translation_id", "category_id", categoryId);
+    }
+
+    @Transactional
+    public Map<String, Object> upsertCategoryTranslation(Long cafeteriaId, Long categoryId, String languageCode, Map<String, Object> request) {
+        requireTenantAccess(cafeteriaId, true);
+        ensureCategory(cafeteriaId, categoryId);
+        return upsertTranslation(cafeteriaId, "menu.category_translations", "category_translation_id", "category_id", categoryId, languageCode, request);
+    }
+
+    @Transactional
+    public void softDeleteCategoryTranslation(Long cafeteriaId, Long categoryId, String languageCode) {
+        Long userId = requireTenantAccess(cafeteriaId, true).userId();
+        ensureCategory(cafeteriaId, categoryId);
+        softDeleteTranslation(cafeteriaId, "menu.category_translations", "category_id", categoryId, languageCode, userId);
+    }
+
     public List<Map<String, Object>> listProducts(Long cafeteriaId, Long categoryId) {
         requireTenantAccess(cafeteriaId, false);
         List<Object> params = new ArrayList<>();
@@ -264,7 +621,130 @@ public class MenuAdminService {
         Map<String, Object> product = findProduct(cafeteriaId, productId);
         product.put("addonGroups", productAddonGroups(cafeteriaId, productId));
         product.put("locations", productLocations(productId));
+        product.put("images", listProductImages(cafeteriaId, productId));
         return product;
+    }
+
+    public PresignedMediaUpload createProductImageUpload(Long cafeteriaId, Long productId, MediaUploadRequest request) {
+        return createProductImageUpload(cafeteriaId, productId, request, true);
+    }
+
+    public PresignedMediaUpload createProductGalleryImageUpload(Long cafeteriaId, Long productId, MediaUploadRequest request) {
+        return createProductImageUpload(cafeteriaId, productId, request, false);
+    }
+
+    private PresignedMediaUpload createProductImageUpload(Long cafeteriaId, Long productId, MediaUploadRequest request, boolean defaultPrimary) {
+        Membership membership = requireTenantAccess(cafeteriaId, true);
+        ensureProduct(cafeteriaId, productId);
+        String purpose = normalizeMediaPurpose(request == null ? null : request.purpose());
+        if (!PURPOSE_MENU_PRODUCT_IMAGE.equals(purpose)) {
+            throw new BadRequestException("Unsupported menu media purpose");
+        }
+        Map<String, Object> metadata = metadataWithDefaultPrimary(request.metadata(), defaultPrimary);
+        return mediaAssetService.createPresignedUpload(new MediaUploadPolicy(
+                "kaffe-msa-menu-admin",
+                cafeteriaId,
+                null,
+                PURPOSE_MENU_PRODUCT_IMAGE,
+                "menu_product",
+                productId,
+                membership.userId(),
+                "tenants/%d/menu/products/%d".formatted(cafeteriaId, productId),
+                request.fileName(),
+                request.contentType(),
+                request.sizeBytes() == null ? 0 : request.sizeBytes(),
+                request.checksumSha256(),
+                metadata
+        ));
+    }
+
+    @Transactional
+    public Map<String, Object> completeProductImageUpload(Long cafeteriaId, Long productId, UUID assetId, MediaCompleteRequest request) {
+        Membership membership = requireTenantAccess(cafeteriaId, true);
+        ensureProduct(cafeteriaId, productId);
+        MediaAsset pending = mediaAssetService.findAsset(assetId, cafeteriaId);
+        ensureProductImageAsset(productId, pending);
+        MediaAsset asset = mediaAssetService.completeUpload(assetId, cafeteriaId, membership.userId(), request);
+        ensureProductImageAsset(productId, asset);
+        return attachProductImage(cafeteriaId, productId, asset);
+    }
+
+    public List<Map<String, Object>> listProductImages(Long cafeteriaId, Long productId) {
+        requireTenantAccess(cafeteriaId, false);
+        ensureProduct(cafeteriaId, productId);
+        return productImages(cafeteriaId, productId);
+    }
+
+    @Transactional
+    public Map<String, Object> updateProductImage(Long cafeteriaId, Long productId, Long productImageId, Map<String, Object> request) {
+        requireTenantAccess(cafeteriaId, true);
+        ensureProduct(cafeteriaId, productId);
+        ensureProductImage(cafeteriaId, productId, productImageId);
+        jdbcTemplate.update("""
+                        update menu.product_images
+                        set alt_text = coalesce(?, alt_text),
+                            caption = coalesce(?, caption),
+                            sort_order = coalesce(?, sort_order),
+                            is_visible = coalesce(?, is_visible),
+                            updated_at = now()
+                        where tenant_id = ?
+                          and product_id = ?
+                          and product_image_id = ?
+                          and deleted_at is null
+                        """,
+                stringOrNull(request.get("altText")),
+                stringOrNull(request.get("caption")),
+                nullableInt(request.get("sortOrder")),
+                nullableBoolean(request.get("visible")),
+                cafeteriaId,
+                productId,
+                productImageId
+        );
+        Boolean primary = nullableBoolean(request.get("primary"));
+        if (Boolean.TRUE.equals(primary)) {
+            setPrimaryProductImage(cafeteriaId, productId, productImageId);
+        } else if (Boolean.FALSE.equals(primary) && isPrimaryProductImage(cafeteriaId, productId, productImageId)) {
+            jdbcTemplate.update("""
+                            update menu.product_images
+                            set is_primary = false,
+                                updated_at = now()
+                            where tenant_id = ?
+                              and product_id = ?
+                              and product_image_id = ?
+                              and deleted_at is null
+                            """,
+                    cafeteriaId,
+                    productId,
+                    productImageId);
+            syncPrimaryProductImage(cafeteriaId, productId);
+        } else {
+            syncPrimaryProductImage(cafeteriaId, productId);
+        }
+        return findProductImage(cafeteriaId, productId, productImageId);
+    }
+
+    @Transactional
+    public void softDeleteProductImage(Long cafeteriaId, Long productId, Long productImageId) {
+        Long userId = requireTenantAccess(cafeteriaId, true).userId();
+        ensureProduct(cafeteriaId, productId);
+        ensureProductImage(cafeteriaId, productId, productImageId);
+        jdbcTemplate.update("""
+                        update menu.product_images
+                        set deleted_at = now(),
+                            deleted_by_user_id = ?,
+                            is_visible = false,
+                            is_primary = false,
+                            updated_at = now()
+                        where tenant_id = ?
+                          and product_id = ?
+                          and product_image_id = ?
+                          and deleted_at is null
+                        """,
+                userId,
+                cafeteriaId,
+                productId,
+                productImageId);
+        syncPrimaryProductImage(cafeteriaId, productId);
     }
 
     @Transactional
@@ -388,6 +868,46 @@ public class MenuAdminService {
                 productId);
     }
 
+    public List<Map<String, Object>> listProductTranslations(Long cafeteriaId, Long productId) {
+        requireTenantAccess(cafeteriaId, false);
+        ensureProduct(cafeteriaId, productId);
+        return listTranslations(cafeteriaId, "menu.product_translations", "product_translation_id", "product_id", productId);
+    }
+
+    @Transactional
+    public Map<String, Object> upsertProductTranslation(Long cafeteriaId, Long productId, String languageCode, Map<String, Object> request) {
+        requireTenantAccess(cafeteriaId, true);
+        ensureProduct(cafeteriaId, productId);
+        return upsertTranslation(cafeteriaId, "menu.product_translations", "product_translation_id", "product_id", productId, languageCode, request);
+    }
+
+    @Transactional
+    public void softDeleteProductTranslation(Long cafeteriaId, Long productId, String languageCode) {
+        Long userId = requireTenantAccess(cafeteriaId, true).userId();
+        ensureProduct(cafeteriaId, productId);
+        softDeleteTranslation(cafeteriaId, "menu.product_translations", "product_id", productId, languageCode, userId);
+    }
+
+    public List<Map<String, Object>> listProductPrices(Long cafeteriaId, Long productId) {
+        requireTenantAccess(cafeteriaId, false);
+        ensureProduct(cafeteriaId, productId);
+        return listPrices(cafeteriaId, "menu.product_prices", "product_price_id", "product_id", productId, "productPriceId");
+    }
+
+    @Transactional
+    public Map<String, Object> upsertProductPrice(Long cafeteriaId, Long productId, String currencyCode, Map<String, Object> request) {
+        requireTenantAccess(cafeteriaId, true);
+        ensureProduct(cafeteriaId, productId);
+        return upsertPrice(cafeteriaId, "menu.product_prices", "product_price_id", "product_id", productId, "productPriceId", currencyCode, request);
+    }
+
+    @Transactional
+    public void softDeleteProductPrice(Long cafeteriaId, Long productId, Long productPriceId) {
+        Long userId = requireTenantAccess(cafeteriaId, true).userId();
+        ensureProduct(cafeteriaId, productId);
+        softDeletePrice(cafeteriaId, "menu.product_prices", "product_price_id", "product_id", productId, productPriceId, userId);
+    }
+
     public List<Map<String, Object>> listAddonGroups(Long cafeteriaId) {
         requireTenantAccess(cafeteriaId, false);
         return jdbcTemplate.query("""
@@ -509,6 +1029,26 @@ public class MenuAdminService {
                 addonGroupId);
     }
 
+    public List<Map<String, Object>> listAddonGroupTranslations(Long cafeteriaId, Long addonGroupId) {
+        requireTenantAccess(cafeteriaId, false);
+        ensureAddonGroup(cafeteriaId, addonGroupId);
+        return listTranslations(cafeteriaId, "menu.addon_group_translations", "addon_group_translation_id", "addon_group_id", addonGroupId);
+    }
+
+    @Transactional
+    public Map<String, Object> upsertAddonGroupTranslation(Long cafeteriaId, Long addonGroupId, String languageCode, Map<String, Object> request) {
+        requireTenantAccess(cafeteriaId, true);
+        ensureAddonGroup(cafeteriaId, addonGroupId);
+        return upsertTranslation(cafeteriaId, "menu.addon_group_translations", "addon_group_translation_id", "addon_group_id", addonGroupId, languageCode, request);
+    }
+
+    @Transactional
+    public void softDeleteAddonGroupTranslation(Long cafeteriaId, Long addonGroupId, String languageCode) {
+        Long userId = requireTenantAccess(cafeteriaId, true).userId();
+        ensureAddonGroup(cafeteriaId, addonGroupId);
+        softDeleteTranslation(cafeteriaId, "menu.addon_group_translations", "addon_group_id", addonGroupId, languageCode, userId);
+    }
+
     public List<Map<String, Object>> listAddons(Long cafeteriaId, Long addonGroupId) {
         requireTenantAccess(cafeteriaId, false);
         if (addonGroupId != null) {
@@ -614,6 +1154,46 @@ public class MenuAdminService {
                 userId,
                 cafeteriaId,
                 addonId);
+    }
+
+    public List<Map<String, Object>> listAddonTranslations(Long cafeteriaId, Long addonId) {
+        requireTenantAccess(cafeteriaId, false);
+        ensureAddon(cafeteriaId, addonId);
+        return listTranslations(cafeteriaId, "menu.addon_translations", "addon_translation_id", "addon_id", addonId);
+    }
+
+    @Transactional
+    public Map<String, Object> upsertAddonTranslation(Long cafeteriaId, Long addonId, String languageCode, Map<String, Object> request) {
+        requireTenantAccess(cafeteriaId, true);
+        ensureAddon(cafeteriaId, addonId);
+        return upsertTranslation(cafeteriaId, "menu.addon_translations", "addon_translation_id", "addon_id", addonId, languageCode, request);
+    }
+
+    @Transactional
+    public void softDeleteAddonTranslation(Long cafeteriaId, Long addonId, String languageCode) {
+        Long userId = requireTenantAccess(cafeteriaId, true).userId();
+        ensureAddon(cafeteriaId, addonId);
+        softDeleteTranslation(cafeteriaId, "menu.addon_translations", "addon_id", addonId, languageCode, userId);
+    }
+
+    public List<Map<String, Object>> listAddonPrices(Long cafeteriaId, Long addonId) {
+        requireTenantAccess(cafeteriaId, false);
+        ensureAddon(cafeteriaId, addonId);
+        return listPrices(cafeteriaId, "menu.addon_prices", "addon_price_id", "addon_id", addonId, "addonPriceId");
+    }
+
+    @Transactional
+    public Map<String, Object> upsertAddonPrice(Long cafeteriaId, Long addonId, String currencyCode, Map<String, Object> request) {
+        requireTenantAccess(cafeteriaId, true);
+        ensureAddon(cafeteriaId, addonId);
+        return upsertPrice(cafeteriaId, "menu.addon_prices", "addon_price_id", "addon_id", addonId, "addonPriceId", currencyCode, request);
+    }
+
+    @Transactional
+    public void softDeleteAddonPrice(Long cafeteriaId, Long addonId, Long addonPriceId) {
+        Long userId = requireTenantAccess(cafeteriaId, true).userId();
+        ensureAddon(cafeteriaId, addonId);
+        softDeletePrice(cafeteriaId, "menu.addon_prices", "addon_price_id", "addon_id", addonId, addonPriceId, userId);
     }
 
     @Transactional
@@ -1090,6 +1670,13 @@ public class MenuAdminService {
         }
     }
 
+    private void ensureExists(String sql, String message, Object... args) {
+        Boolean exists = jdbcTemplate.queryForObject(sql, Boolean.class, args);
+        if (!Boolean.TRUE.equals(exists)) {
+            throw new ResourceNotFoundException(message);
+        }
+    }
+
     private void softDeleteMenuJoins(Long cafeteriaId, Long menuId, Long userId) {
         softDeleteMenuLocations(cafeteriaId, menuId, userId);
         jdbcTemplate.update("""
@@ -1161,6 +1748,52 @@ public class MenuAdminService {
                 rs -> productRow(rs),
                 cafeteriaId,
                 productId);
+    }
+
+    private List<Map<String, Object>> productImages(Long cafeteriaId, Long productId) {
+        return jdbcTemplate.query("""
+                        select *
+                        from menu.product_images
+                        where tenant_id = ?
+                          and product_id = ?
+                          and deleted_at is null
+                        order by is_primary desc, sort_order asc, product_image_id asc
+                        """,
+                (rs, rowNum) -> productImageRow(rs),
+                cafeteriaId,
+                productId);
+    }
+
+    private Map<String, Object> findProductImage(Long cafeteriaId, Long productId, Long productImageId) {
+        return queryOne("""
+                        select *
+                        from menu.product_images
+                        where tenant_id = ?
+                          and product_id = ?
+                          and product_image_id = ?
+                          and deleted_at is null
+                        """,
+                rs -> productImageRow(rs),
+                cafeteriaId,
+                productId,
+                productImageId);
+    }
+
+    private void ensureProductImage(Long cafeteriaId, Long productId, Long productImageId) {
+        ensureExists("""
+                        select exists(
+                            select 1
+                            from menu.product_images
+                            where tenant_id = ?
+                              and product_id = ?
+                              and product_image_id = ?
+                              and deleted_at is null
+                        )
+                        """,
+                "Product image was not found for this product",
+                cafeteriaId,
+                productId,
+                productImageId);
     }
 
     private Map<String, Object> findAddonGroup(Long cafeteriaId, Long addonGroupId) {
@@ -1302,6 +1935,497 @@ public class MenuAdminService {
                 productId);
     }
 
+    private void ensureDefaultMenuSettings(Long cafeteriaId) {
+        jdbcTemplate.update("""
+                        insert into menu.tenant_menu_settings (tenant_id, default_language_code, base_currency_code)
+                        values (?, 'es', 'MXN')
+                        on conflict (tenant_id) do nothing
+                        """,
+                cafeteriaId);
+        jdbcTemplate.update("""
+                        insert into menu.tenant_supported_languages (
+                            tenant_id, language_code, display_name, is_default, is_active, sort_order
+                        )
+                        values (?, 'es', 'Espanol', true, true, 1)
+                        on conflict (tenant_id, language_code) do nothing
+                        """,
+                cafeteriaId);
+        jdbcTemplate.update("""
+                        insert into menu.tenant_supported_currencies (
+                            tenant_id, currency_code, display_name, symbol, is_base, is_active, sort_order
+                        )
+                        values (?, 'MXN', 'Peso mexicano', '$', true, true, 1)
+                        on conflict (tenant_id, currency_code) do nothing
+                        """,
+                cafeteriaId);
+    }
+
+    private Map<String, Object> findMenuSettings(Long cafeteriaId) {
+        return queryOne("""
+                        select *
+                        from menu.tenant_menu_settings
+                        where tenant_id = ?
+                          and deleted_at is null
+                        """,
+                rs -> menuSettingsRow(rs),
+                cafeteriaId);
+    }
+
+    private Map<String, Object> findLanguage(Long cafeteriaId, String languageCode) {
+        return queryOne("""
+                        select *
+                        from menu.tenant_supported_languages
+                        where tenant_id = ?
+                          and language_code = ?
+                          and deleted_at is null
+                        """,
+                rs -> languageRow(rs),
+                cafeteriaId,
+                languageCode);
+    }
+
+    private void upsertLanguage(Long cafeteriaId, String languageCode, Map<String, Object> request) {
+        if (languageCode == null) {
+            throw new BadRequestException("languageCode is required");
+        }
+        boolean defaultLanguage = booleanValue(request.getOrDefault("default", false));
+        if (defaultLanguage) {
+            jdbcTemplate.update("""
+                            update menu.tenant_supported_languages
+                            set is_default = false,
+                                updated_at = now()
+                            where tenant_id = ?
+                              and deleted_at is null
+                            """,
+                    cafeteriaId);
+        }
+        jdbcTemplate.update("""
+                        insert into menu.tenant_supported_languages (
+                            tenant_id, language_code, display_name, is_default, is_active, sort_order,
+                            deleted_at, deleted_by_user_id
+                        )
+                        values (?, ?, ?, ?, ?, ?, null, null)
+                        on conflict (tenant_id, language_code) do update set
+                            display_name = excluded.display_name,
+                            is_default = excluded.is_default,
+                            is_active = excluded.is_active,
+                            sort_order = excluded.sort_order,
+                            deleted_at = null,
+                            deleted_by_user_id = null,
+                            updated_at = now()
+                        """,
+                cafeteriaId,
+                languageCode,
+                stringOrNull(request.get("displayName")) == null ? languageCode : stringOrNull(request.get("displayName")),
+                defaultLanguage,
+                booleanValue(request.getOrDefault("active", true)),
+                intValue(request.getOrDefault("sortOrder", 0)));
+    }
+
+    private Map<String, Object> findCurrency(Long cafeteriaId, String currencyCode) {
+        return queryOne("""
+                        select *
+                        from menu.tenant_supported_currencies
+                        where tenant_id = ?
+                          and currency_code = ?
+                          and deleted_at is null
+                        """,
+                rs -> currencyRow(rs),
+                cafeteriaId,
+                currencyCode);
+    }
+
+    private Map<String, Object> findExchangeRate(Long cafeteriaId, Long exchangeRateId) {
+        return queryOne("""
+                        select *
+                        from menu.tenant_exchange_rates
+                        where tenant_id = ?
+                          and exchange_rate_id = ?
+                          and deleted_at is null
+                        """,
+                rs -> exchangeRateRow(rs),
+                cafeteriaId,
+                exchangeRateId);
+    }
+
+    private void validateCurrencyPair(Long cafeteriaId, String fromCurrencyCode, String toCurrencyCode) {
+        if (fromCurrencyCode == null || toCurrencyCode == null) {
+            throw new BadRequestException("fromCurrencyCode and toCurrencyCode are required");
+        }
+        if (fromCurrencyCode.equals(toCurrencyCode)) {
+            throw new BadRequestException("fromCurrencyCode and toCurrencyCode must be different");
+        }
+        findCurrency(cafeteriaId, fromCurrencyCode);
+        findCurrency(cafeteriaId, toCurrencyCode);
+    }
+
+    private void deactivateActiveExchangeRatePair(
+            Long cafeteriaId,
+            String fromCurrencyCode,
+            String toCurrencyCode,
+            Long exceptExchangeRateId
+    ) {
+        String exceptCondition = exceptExchangeRateId == null ? "" : "  and exchange_rate_id <> ?\n";
+        List<Object> params = new ArrayList<>(List.of(cafeteriaId, fromCurrencyCode, toCurrencyCode));
+        if (exceptExchangeRateId != null) {
+            params.add(exceptExchangeRateId);
+        }
+        jdbcTemplate.update("""
+                        update menu.tenant_exchange_rates
+                        set is_active = false,
+                            effective_to = coalesce(effective_to, now()),
+                            updated_at = now()
+                        where tenant_id = ?
+                          and from_currency_code = ?
+                          and to_currency_code = ?
+                          and is_active = true
+                          and deleted_at is null
+                          and effective_to is null
+                        """ + exceptCondition,
+                params.toArray());
+    }
+
+    private List<Map<String, Object>> listTranslations(
+            Long cafeteriaId,
+            String tableName,
+            String translationIdColumn,
+            String entityIdColumn,
+            Long entityId
+    ) {
+        return jdbcTemplate.query("""
+                        select *
+                        from %s
+                        where tenant_id = ?
+                          and %s = ?
+                          and deleted_at is null
+                        order by language_code asc
+                        """.formatted(tableName, entityIdColumn),
+                (rs, rowNum) -> translationRow(rs, translationIdColumn, entityIdColumn),
+                cafeteriaId,
+                entityId);
+    }
+
+    private Map<String, Object> upsertTranslation(
+            Long cafeteriaId,
+            String tableName,
+            String translationIdColumn,
+            String entityIdColumn,
+            Long entityId,
+            String languageCode,
+            Map<String, Object> request
+    ) {
+        String normalizedLanguageCode = normalizeLanguageCode(languageCode);
+        findLanguage(cafeteriaId, normalizedLanguageCode);
+        Long translationId = jdbcTemplate.queryForObject("""
+                        insert into %s (
+                            tenant_id, %s, language_code, name, description, is_active,
+                            deleted_at, deleted_by_user_id
+                        )
+                        values (?, ?, ?, ?, ?, ?, null, null)
+                        on conflict (%s, language_code) where deleted_at is null do update set
+                            name = excluded.name,
+                            description = excluded.description,
+                            is_active = excluded.is_active,
+                            deleted_at = null,
+                            deleted_by_user_id = null,
+                            updated_at = now()
+                        returning %s
+                        """.formatted(tableName, entityIdColumn, entityIdColumn, translationIdColumn),
+                Long.class,
+                cafeteriaId,
+                entityId,
+                normalizedLanguageCode,
+                requiredString(request, "name"),
+                stringOrNull(request.get("description")),
+                booleanValue(request.getOrDefault("active", true)));
+        return findTranslation(cafeteriaId, tableName, translationIdColumn, entityIdColumn, entityId, translationId);
+    }
+
+    private Map<String, Object> findTranslation(
+            Long cafeteriaId,
+            String tableName,
+            String translationIdColumn,
+            String entityIdColumn,
+            Long entityId,
+            Long translationId
+    ) {
+        return queryOne("""
+                        select *
+                        from %s
+                        where tenant_id = ?
+                          and %s = ?
+                          and %s = ?
+                          and deleted_at is null
+                        """.formatted(tableName, entityIdColumn, translationIdColumn),
+                rs -> translationRow(rs, translationIdColumn, entityIdColumn),
+                cafeteriaId,
+                entityId,
+                translationId);
+    }
+
+    private void softDeleteTranslation(
+            Long cafeteriaId,
+            String tableName,
+            String entityIdColumn,
+            Long entityId,
+            String languageCode,
+            Long userId
+    ) {
+        String normalizedLanguageCode = normalizeLanguageCode(languageCode);
+        int updated = jdbcTemplate.update("""
+                        update %s
+                        set is_active = false,
+                            deleted_at = now(),
+                            deleted_by_user_id = ?,
+                            updated_at = now()
+                        where tenant_id = ?
+                          and %s = ?
+                          and language_code = ?
+                          and deleted_at is null
+                        """.formatted(tableName, entityIdColumn),
+                userId,
+                cafeteriaId,
+                entityId,
+                normalizedLanguageCode);
+        if (updated == 0) {
+            throw new ResourceNotFoundException("Translation was not found");
+        }
+    }
+
+    private List<Map<String, Object>> listPrices(
+            Long cafeteriaId,
+            String tableName,
+            String priceIdColumn,
+            String entityIdColumn,
+            Long entityId,
+            String responseIdName
+    ) {
+        return jdbcTemplate.query("""
+                        select p.*, l.name as location_name
+                        from %s p
+                        left join core.locations l
+                          on l.location_id = p.location_id
+                         and l.tenant_id = p.tenant_id
+                        where p.tenant_id = ?
+                          and p.%s = ?
+                          and p.deleted_at is null
+                        order by p.is_active desc, p.location_id nulls first, p.currency_code asc, p.effective_from desc
+                        """.formatted(tableName, entityIdColumn),
+                (rs, rowNum) -> priceRow(rs, priceIdColumn, entityIdColumn, responseIdName),
+                cafeteriaId,
+                entityId);
+    }
+
+    private Map<String, Object> upsertPrice(
+            Long cafeteriaId,
+            String tableName,
+            String priceIdColumn,
+            String entityIdColumn,
+            Long entityId,
+            String responseIdName,
+            String currencyCode,
+            Map<String, Object> request
+    ) {
+        String normalizedCurrencyCode = normalizeCurrencyCode(currencyCode);
+        findCurrency(cafeteriaId, normalizedCurrencyCode);
+        Long locationId = nullableLong(request.get("locationId"));
+        if (locationId != null) {
+            ensureLocation(cafeteriaId, locationId);
+        }
+        Integer amount = moneyAmount(request.get("amount"));
+        boolean active = booleanValue(request.getOrDefault("active", true));
+        OffsetDateTime effectiveTo = nullableOffsetDateTime(request.get("effectiveTo"));
+        if (active && effectiveTo == null) {
+            deactivateActivePrice(cafeteriaId, tableName, entityIdColumn, entityId, normalizedCurrencyCode, locationId);
+        }
+        Long priceId = jdbcTemplate.queryForObject("""
+                        insert into %s (
+                            tenant_id, %s, location_id, currency_code, amount, is_active,
+                            effective_from, effective_to, deleted_at, deleted_by_user_id
+                        )
+                        values (?, ?, ?, ?, ?, ?, coalesce(cast(? as timestamp with time zone), now()), cast(? as timestamp with time zone), null, null)
+                        returning %s
+                        """.formatted(tableName, entityIdColumn, priceIdColumn),
+                Long.class,
+                cafeteriaId,
+                entityId,
+                locationId,
+                normalizedCurrencyCode,
+                amount,
+                active,
+                nullableOffsetDateTime(request.get("effectiveFrom")),
+                effectiveTo);
+        return findPrice(cafeteriaId, tableName, priceIdColumn, entityIdColumn, entityId, priceId, responseIdName);
+    }
+
+    private Map<String, Object> findPrice(
+            Long cafeteriaId,
+            String tableName,
+            String priceIdColumn,
+            String entityIdColumn,
+            Long entityId,
+            Long priceId,
+            String responseIdName
+    ) {
+        return queryOne("""
+                        select p.*, l.name as location_name
+                        from %s p
+                        left join core.locations l
+                          on l.location_id = p.location_id
+                         and l.tenant_id = p.tenant_id
+                        where p.tenant_id = ?
+                          and p.%s = ?
+                          and p.%s = ?
+                          and p.deleted_at is null
+                        """.formatted(tableName, entityIdColumn, priceIdColumn),
+                rs -> priceRow(rs, priceIdColumn, entityIdColumn, responseIdName),
+                cafeteriaId,
+                entityId,
+                priceId);
+    }
+
+    private void deactivateActivePrice(
+            Long cafeteriaId,
+            String tableName,
+            String entityIdColumn,
+            Long entityId,
+            String currencyCode,
+            Long locationId
+    ) {
+        String locationCondition = locationId == null ? "  and location_id is null\n" : "  and location_id = ?\n";
+        List<Object> params = new ArrayList<>(List.of(cafeteriaId, entityId, currencyCode));
+        if (locationId != null) {
+            params.add(locationId);
+        }
+        jdbcTemplate.update("""
+                        update %s
+                        set is_active = false,
+                            effective_to = coalesce(effective_to, now()),
+                            updated_at = now()
+                        where tenant_id = ?
+                          and %s = ?
+                          and currency_code = ?
+                          and is_active = true
+                          and deleted_at is null
+                          and effective_to is null
+                        %s
+                        """.formatted(tableName, entityIdColumn, locationCondition),
+                params.toArray());
+    }
+
+    private void softDeletePrice(
+            Long cafeteriaId,
+            String tableName,
+            String priceIdColumn,
+            String entityIdColumn,
+            Long entityId,
+            Long priceId,
+            Long userId
+    ) {
+        int updated = jdbcTemplate.update("""
+                        update %s
+                        set is_active = false,
+                            deleted_at = now(),
+                            deleted_by_user_id = ?,
+                            updated_at = now()
+                        where tenant_id = ?
+                          and %s = ?
+                          and %s = ?
+                          and deleted_at is null
+                        """.formatted(tableName, entityIdColumn, priceIdColumn),
+                userId,
+                cafeteriaId,
+                entityId,
+                priceId);
+        if (updated == 0) {
+            throw new ResourceNotFoundException("Price was not found");
+        }
+    }
+
+    private Map<String, Object> menuSettingsRow(ResultSet rs) throws SQLException {
+        return row(
+                "cafeteriaId", rs.getLong("tenant_id"),
+                "defaultLanguageCode", rs.getString("default_language_code"),
+                "baseCurrencyCode", rs.getString("base_currency_code"),
+                "allowExchangeConversion", rs.getBoolean("allow_exchange_conversion")
+        );
+    }
+
+    private Map<String, Object> languageRow(ResultSet rs) throws SQLException {
+        return row(
+                "cafeteriaId", rs.getLong("tenant_id"),
+                "languageCode", rs.getString("language_code"),
+                "displayName", rs.getString("display_name"),
+                "default", rs.getBoolean("is_default"),
+                "active", rs.getBoolean("is_active"),
+                "sortOrder", rs.getInt("sort_order"),
+                "createdAt", rs.getTimestamp("created_at"),
+                "updatedAt", rs.getTimestamp("updated_at")
+        );
+    }
+
+    private Map<String, Object> currencyRow(ResultSet rs) throws SQLException {
+        return row(
+                "cafeteriaId", rs.getLong("tenant_id"),
+                "currencyCode", rs.getString("currency_code"),
+                "displayName", rs.getString("display_name"),
+                "symbol", rs.getString("symbol"),
+                "base", rs.getBoolean("is_base"),
+                "active", rs.getBoolean("is_active"),
+                "sortOrder", rs.getInt("sort_order"),
+                "createdAt", rs.getTimestamp("created_at"),
+                "updatedAt", rs.getTimestamp("updated_at")
+        );
+    }
+
+    private Map<String, Object> exchangeRateRow(ResultSet rs) throws SQLException {
+        return row(
+                "exchangeRateId", rs.getLong("exchange_rate_id"),
+                "cafeteriaId", rs.getLong("tenant_id"),
+                "fromCurrencyCode", rs.getString("from_currency_code"),
+                "toCurrencyCode", rs.getString("to_currency_code"),
+                "rate", rs.getBigDecimal("rate"),
+                "effectiveFrom", rs.getObject("effective_from", OffsetDateTime.class),
+                "effectiveTo", rs.getObject("effective_to", OffsetDateTime.class),
+                "active", rs.getBoolean("is_active"),
+                "notes", rs.getString("notes"),
+                "createdAt", rs.getTimestamp("created_at"),
+                "updatedAt", rs.getTimestamp("updated_at")
+        );
+    }
+
+    private Map<String, Object> translationRow(ResultSet rs, String translationIdColumn, String entityIdColumn) throws SQLException {
+        return row(
+                "translationId", rs.getLong(translationIdColumn),
+                "cafeteriaId", rs.getLong("tenant_id"),
+                entityIdKey(entityIdColumn), rs.getLong(entityIdColumn),
+                "languageCode", rs.getString("language_code"),
+                "name", rs.getString("name"),
+                "description", rs.getString("description"),
+                "active", rs.getBoolean("is_active"),
+                "createdAt", rs.getTimestamp("created_at"),
+                "updatedAt", rs.getTimestamp("updated_at")
+        );
+    }
+
+    private Map<String, Object> priceRow(ResultSet rs, String priceIdColumn, String entityIdColumn, String responseIdName) throws SQLException {
+        return row(
+                responseIdName, rs.getLong(priceIdColumn),
+                "priceId", rs.getLong(priceIdColumn),
+                "cafeteriaId", rs.getLong("tenant_id"),
+                entityIdKey(entityIdColumn), rs.getLong(entityIdColumn),
+                "locationId", nullableColumnLong(rs, "location_id"),
+                "locationName", nullableColumnString(rs, "location_name"),
+                "currencyCode", rs.getString("currency_code"),
+                "amount", rs.getInt("amount"),
+                "active", rs.getBoolean("is_active"),
+                "effectiveFrom", rs.getObject("effective_from", OffsetDateTime.class),
+                "effectiveTo", rs.getObject("effective_to", OffsetDateTime.class),
+                "createdAt", rs.getTimestamp("created_at"),
+                "updatedAt", rs.getTimestamp("updated_at")
+        );
+    }
+
     private Map<String, Object> menuRow(ResultSet rs) throws SQLException {
         return row(
                 "menuId", rs.getLong("menu_id"),
@@ -1337,10 +2461,261 @@ public class MenuAdminService {
                 "description", rs.getString("description"),
                 "basePrice", rs.getInt("base_price"),
                 "imageUrl", rs.getString("image_url"),
+                "imageAssetId", nullableColumnString(rs, "image_asset_id"),
                 "featured", rs.getBoolean("is_featured"),
                 "available", rs.getBoolean("is_available"),
                 "sortOrder", rs.getInt("sort_order")
         );
+    }
+
+    private Map<String, Object> productImageRow(ResultSet rs) throws SQLException {
+        return row(
+                "productImageId", rs.getLong("product_image_id"),
+                "cafeteriaId", rs.getLong("tenant_id"),
+                "productId", rs.getLong("product_id"),
+                "assetId", nullableColumnString(rs, "asset_id"),
+                "imageUrl", rs.getString("image_url"),
+                "altText", rs.getString("alt_text"),
+                "caption", rs.getString("caption"),
+                "sortOrder", rs.getInt("sort_order"),
+                "primary", rs.getBoolean("is_primary"),
+                "visible", rs.getBoolean("is_visible"),
+                "createdAt", rs.getTimestamp("created_at"),
+                "updatedAt", rs.getTimestamp("updated_at")
+        );
+    }
+
+    private Map<String, Object> attachProductImage(Long cafeteriaId, Long productId, MediaAsset asset) {
+        boolean hasImages = hasProductImages(cafeteriaId, productId);
+        boolean primary = metadataBoolean(asset, "primary", !hasImages);
+        boolean visible = metadataBoolean(asset, "visible", true);
+        if (primary) {
+            clearPrimaryProductImages(cafeteriaId, productId);
+        }
+
+        Long productImageId = jdbcTemplate.queryForObject("""
+                        insert into menu.product_images (
+                            tenant_id, product_id, asset_id, image_url, alt_text, caption,
+                            sort_order, is_primary, is_visible
+                        )
+                        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        returning product_image_id
+                        """,
+                Long.class,
+                cafeteriaId,
+                productId,
+                asset.assetId(),
+                asset.publicUrl(),
+                metadataString(asset, "altText", 160),
+                metadataString(asset, "caption", 180),
+                metadataInt(asset, "sortOrder", nextProductImageSortOrder(cafeteriaId, productId)),
+                primary,
+                visible
+        );
+
+        if (primary || !hasPrimaryProductImage(cafeteriaId, productId)) {
+            applyPrimaryProductImage(cafeteriaId, productId, productImageId);
+        } else {
+            syncPrimaryProductImage(cafeteriaId, productId);
+        }
+        return findProductImage(cafeteriaId, productId, productImageId);
+    }
+
+    private void ensureProductImageAsset(Long productId, MediaAsset asset) {
+        if (!PURPOSE_MENU_PRODUCT_IMAGE.equals(asset.purpose())
+                || !"menu_product".equals(asset.entityType())
+                || !productId.equals(asset.entityId())) {
+            throw new BadRequestException("Media asset does not belong to this product");
+        }
+    }
+
+    private void setPrimaryProductImage(Long cafeteriaId, Long productId, Long productImageId) {
+        Map<String, Object> image = findProductImage(cafeteriaId, productId, productImageId);
+        if (!Boolean.TRUE.equals(image.get("visible"))) {
+            throw new BadRequestException("Only a visible product image can be primary");
+        }
+        applyPrimaryProductImage(cafeteriaId, productId, productImageId);
+    }
+
+    private void syncPrimaryProductImage(Long cafeteriaId, Long productId) {
+        Long primaryImageId = jdbcTemplate.query("""
+                        select product_image_id
+                        from menu.product_images
+                        where tenant_id = ?
+                          and product_id = ?
+                          and is_visible = true
+                          and deleted_at is null
+                        order by is_primary desc, sort_order asc, product_image_id asc
+                        limit 1
+                        """,
+                rs -> rs.next() ? rs.getObject("product_image_id", Long.class) : null,
+                cafeteriaId,
+                productId);
+        if (primaryImageId == null) {
+            jdbcTemplate.update("""
+                            update menu.products
+                            set image_url = null,
+                                image_asset_id = null,
+                                updated_at = now()
+                            where tenant_id = ?
+                              and product_id = ?
+                              and deleted_at is null
+                            """,
+                    cafeteriaId,
+                    productId);
+            return;
+        }
+        applyPrimaryProductImage(cafeteriaId, productId, primaryImageId);
+    }
+
+    private void applyPrimaryProductImage(Long cafeteriaId, Long productId, Long productImageId) {
+        clearPrimaryProductImages(cafeteriaId, productId);
+        jdbcTemplate.update("""
+                        update menu.product_images
+                        set is_primary = true,
+                            is_visible = true,
+                            updated_at = now()
+                        where tenant_id = ?
+                          and product_id = ?
+                          and product_image_id = ?
+                          and deleted_at is null
+                        """,
+                cafeteriaId,
+                productId,
+                productImageId);
+        jdbcTemplate.update("""
+                        update menu.products p
+                        set image_url = pi.image_url,
+                            image_asset_id = pi.asset_id,
+                            updated_at = now()
+                        from menu.product_images pi
+                        where p.tenant_id = pi.tenant_id
+                          and p.product_id = pi.product_id
+                          and pi.tenant_id = ?
+                          and pi.product_id = ?
+                          and pi.product_image_id = ?
+                          and pi.deleted_at is null
+                          and p.deleted_at is null
+                        """,
+                cafeteriaId,
+                productId,
+                productImageId);
+    }
+
+    private void clearPrimaryProductImages(Long cafeteriaId, Long productId) {
+        jdbcTemplate.update("""
+                        update menu.product_images
+                        set is_primary = false,
+                            updated_at = now()
+                        where tenant_id = ?
+                          and product_id = ?
+                          and is_primary = true
+                          and deleted_at is null
+                        """,
+                cafeteriaId,
+                productId);
+    }
+
+    private boolean hasProductImages(Long cafeteriaId, Long productId) {
+        Boolean exists = jdbcTemplate.queryForObject("""
+                        select exists(
+                            select 1
+                            from menu.product_images
+                            where tenant_id = ?
+                              and product_id = ?
+                              and deleted_at is null
+                        )
+                        """,
+                Boolean.class,
+                cafeteriaId,
+                productId);
+        return Boolean.TRUE.equals(exists);
+    }
+
+    private boolean hasPrimaryProductImage(Long cafeteriaId, Long productId) {
+        Boolean exists = jdbcTemplate.queryForObject("""
+                        select exists(
+                            select 1
+                            from menu.product_images
+                            where tenant_id = ?
+                              and product_id = ?
+                              and is_primary = true
+                              and is_visible = true
+                              and deleted_at is null
+                        )
+                        """,
+                Boolean.class,
+                cafeteriaId,
+                productId);
+        return Boolean.TRUE.equals(exists);
+    }
+
+    private boolean isPrimaryProductImage(Long cafeteriaId, Long productId, Long productImageId) {
+        Boolean primary = jdbcTemplate.queryForObject("""
+                        select coalesce((
+                            select is_primary
+                            from menu.product_images
+                            where tenant_id = ?
+                              and product_id = ?
+                              and product_image_id = ?
+                              and deleted_at is null
+                        ), false)
+                        """,
+                Boolean.class,
+                cafeteriaId,
+                productId,
+                productImageId);
+        return Boolean.TRUE.equals(primary);
+    }
+
+    private int nextProductImageSortOrder(Long cafeteriaId, Long productId) {
+        Integer max = jdbcTemplate.queryForObject("""
+                        select coalesce(max(sort_order), -1)
+                        from menu.product_images
+                        where tenant_id = ?
+                          and product_id = ?
+                          and deleted_at is null
+                        """,
+                Integer.class,
+                cafeteriaId,
+                productId);
+        return (max == null ? -1 : max) + 1;
+    }
+
+    private Map<String, Object> metadataWithDefaultPrimary(Map<String, Object> metadata, boolean defaultPrimary) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (metadata != null) {
+            result.putAll(metadata);
+        }
+        result.putIfAbsent("primary", defaultPrimary);
+        return result;
+    }
+
+    private String metadataString(MediaAsset asset, String key, int maxLength) {
+        Object value = asset.metadata() == null ? null : asset.metadata().get(key);
+        String text = stringOrNull(value);
+        if (text == null) {
+            return null;
+        }
+        return text.length() > maxLength ? text.substring(0, maxLength) : text;
+    }
+
+    private boolean metadataBoolean(MediaAsset asset, String key, boolean fallback) {
+        Object value = asset.metadata() == null ? null : asset.metadata().get(key);
+        Boolean bool = nullableBoolean(value);
+        return bool == null ? fallback : bool;
+    }
+
+    private int metadataInt(MediaAsset asset, String key, int fallback) {
+        Integer value = nullableInt(asset.metadata() == null ? null : asset.metadata().get(key));
+        return value == null ? fallback : value;
+    }
+
+    private String normalizeMediaPurpose(String purpose) {
+        if (purpose == null || purpose.isBlank()) {
+            throw new BadRequestException("Media purpose is required");
+        }
+        return purpose.trim().toLowerCase(Locale.ROOT).replace('_', '-');
     }
 
     private Map<String, Object> addonGroupRow(ResultSet rs) throws SQLException {
@@ -1447,6 +2822,80 @@ public class MenuAdminService {
         return value;
     }
 
+    private String normalizeCurrencyCode(String currencyCode) {
+        String value = stringOrNull(currencyCode);
+        if (value == null) {
+            return null;
+        }
+        value = value.toUpperCase(Locale.ROOT);
+        if (!value.matches("^[A-Z]{3}$")) {
+            throw new BadRequestException("currencyCode must be ISO 4217 format, for example MXN, USD or EUR");
+        }
+        return value;
+    }
+
+    private String normalizeLanguageCode(String languageCode) {
+        String value = stringOrNull(languageCode);
+        if (value == null) {
+            return null;
+        }
+        String[] parts = value.replace('_', '-').split("-", 2);
+        String normalized = parts.length == 1
+                ? parts[0].toLowerCase(Locale.ROOT)
+                : parts[0].toLowerCase(Locale.ROOT) + "-" + parts[1].toUpperCase(Locale.ROOT);
+        if (!normalized.matches("^[a-z]{2}(-[A-Z]{2})?$")) {
+            throw new BadRequestException("languageCode must be ISO language format, for example es, en or en-US");
+        }
+        return normalized;
+    }
+
+    private BigDecimal decimalValue(Object value) {
+        BigDecimal decimal = nullableBigDecimal(value);
+        if (decimal == null) {
+            throw new BadRequestException("Decimal value is required");
+        }
+        if (decimal.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new BadRequestException("Decimal value must be greater than zero");
+        }
+        return decimal;
+    }
+
+    private Integer moneyAmount(Object value) {
+        Integer amount = nullableInt(value);
+        if (amount == null) {
+            throw new BadRequestException("amount is required");
+        }
+        if (amount < 0) {
+            throw new BadRequestException("amount must be greater than or equal to zero");
+        }
+        return amount;
+    }
+
+    private BigDecimal nullableBigDecimal(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof BigDecimal decimal) {
+            return decimal;
+        }
+        if (value instanceof Number number) {
+            return new BigDecimal(number.toString());
+        }
+        String text = String.valueOf(value).trim();
+        return text.isBlank() ? null : new BigDecimal(text);
+    }
+
+    private OffsetDateTime nullableOffsetDateTime(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof OffsetDateTime dateTime) {
+            return dateTime;
+        }
+        String text = String.valueOf(value).trim();
+        return text.isBlank() ? null : OffsetDateTime.parse(text);
+    }
+
     private Long requiredLong(Map<String, Object> request, String key) {
         Long value = nullableLong(request.get(key));
         if (value == null) {
@@ -1511,6 +2960,16 @@ public class MenuAdminService {
     private boolean booleanValue(Object value) {
         Boolean bool = nullableBoolean(value);
         return bool != null && bool;
+    }
+
+    private String entityIdKey(String entityIdColumn) {
+        return switch (entityIdColumn) {
+            case "category_id" -> "categoryId";
+            case "product_id" -> "productId";
+            case "addon_group_id" -> "addonGroupId";
+            case "addon_id" -> "addonId";
+            default -> "entityId";
+        };
     }
 
     private Map<String, Object> row(Object... values) {

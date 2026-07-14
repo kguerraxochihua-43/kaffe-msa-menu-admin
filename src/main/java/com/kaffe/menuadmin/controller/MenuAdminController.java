@@ -1,6 +1,9 @@
 package com.kaffe.menuadmin.controller;
 
 import com.kaffe.common.web.ApiResponse;
+import com.kaffe.common.media.MediaCompleteRequest;
+import com.kaffe.common.media.MediaUploadRequest;
+import com.kaffe.common.media.PresignedMediaUpload;
 import com.kaffe.menuadmin.service.MenuAdminService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -15,6 +18,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/menu-admin/cafeterias/{cafeteriaId}")
@@ -22,6 +26,96 @@ import java.util.Map;
 public class MenuAdminController {
 
     private final MenuAdminService menuAdminService;
+
+    @GetMapping("/settings/menu")
+    public ApiResponse<Map<String, Object>> getMenuSettings(@PathVariable Long cafeteriaId) {
+        return ApiResponse.ok("Menu settings found", menuAdminService.getMenuSettings(cafeteriaId));
+    }
+
+    @PutMapping("/settings/menu")
+    public ApiResponse<Map<String, Object>> updateMenuSettings(
+            @PathVariable Long cafeteriaId,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok("Menu settings updated successfully", menuAdminService.updateMenuSettings(cafeteriaId, request));
+    }
+
+    @GetMapping("/languages")
+    public ApiResponse<List<Map<String, Object>>> listLanguages(@PathVariable Long cafeteriaId) {
+        return ApiResponse.ok("Languages found", menuAdminService.listLanguages(cafeteriaId));
+    }
+
+    @PutMapping("/languages/{languageCode}")
+    public ApiResponse<Map<String, Object>> upsertLanguage(
+            @PathVariable Long cafeteriaId,
+            @PathVariable String languageCode,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok("Language saved successfully", menuAdminService.upsertLanguageConfig(cafeteriaId, languageCode, request));
+    }
+
+    @DeleteMapping("/languages/{languageCode}")
+    public ApiResponse<Void> deleteLanguage(
+            @PathVariable Long cafeteriaId,
+            @PathVariable String languageCode
+    ) {
+        menuAdminService.softDeleteLanguage(cafeteriaId, languageCode);
+        return ApiResponse.ok("Language deleted successfully", null);
+    }
+
+    @GetMapping("/currencies")
+    public ApiResponse<List<Map<String, Object>>> listCurrencies(@PathVariable Long cafeteriaId) {
+        return ApiResponse.ok("Currencies found", menuAdminService.listCurrencies(cafeteriaId));
+    }
+
+    @PutMapping("/currencies/{currencyCode}")
+    public ApiResponse<Map<String, Object>> upsertCurrency(
+            @PathVariable Long cafeteriaId,
+            @PathVariable String currencyCode,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok("Currency saved successfully", menuAdminService.upsertCurrency(cafeteriaId, currencyCode, request));
+    }
+
+    @DeleteMapping("/currencies/{currencyCode}")
+    public ApiResponse<Void> deleteCurrency(
+            @PathVariable Long cafeteriaId,
+            @PathVariable String currencyCode
+    ) {
+        menuAdminService.softDeleteCurrency(cafeteriaId, currencyCode);
+        return ApiResponse.ok("Currency deleted successfully", null);
+    }
+
+    @GetMapping("/exchange-rates")
+    public ApiResponse<List<Map<String, Object>>> listExchangeRates(@PathVariable Long cafeteriaId) {
+        return ApiResponse.ok("Exchange rates found", menuAdminService.listExchangeRates(cafeteriaId));
+    }
+
+    @PostMapping("/exchange-rates")
+    public ApiResponse<Map<String, Object>> createExchangeRate(
+            @PathVariable Long cafeteriaId,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok("Exchange rate created successfully", menuAdminService.createExchangeRate(cafeteriaId, request));
+    }
+
+    @PutMapping("/exchange-rates/{exchangeRateId}")
+    public ApiResponse<Map<String, Object>> updateExchangeRate(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long exchangeRateId,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok("Exchange rate updated successfully", menuAdminService.updateExchangeRate(cafeteriaId, exchangeRateId, request));
+    }
+
+    @DeleteMapping("/exchange-rates/{exchangeRateId}")
+    public ApiResponse<Void> deleteExchangeRate(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long exchangeRateId
+    ) {
+        menuAdminService.softDeleteExchangeRate(cafeteriaId, exchangeRateId);
+        return ApiResponse.ok("Exchange rate deleted successfully", null);
+    }
 
     @GetMapping("/menus")
     public ApiResponse<List<Map<String, Object>>> listMenus(@PathVariable Long cafeteriaId) {
@@ -110,6 +204,34 @@ public class MenuAdminController {
         return ApiResponse.ok("Category deleted successfully", null);
     }
 
+    @GetMapping("/categories/{categoryId}/translations")
+    public ApiResponse<List<Map<String, Object>>> listCategoryTranslations(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long categoryId
+    ) {
+        return ApiResponse.ok("Category translations found", menuAdminService.listCategoryTranslations(cafeteriaId, categoryId));
+    }
+
+    @PutMapping("/categories/{categoryId}/translations/{languageCode}")
+    public ApiResponse<Map<String, Object>> upsertCategoryTranslation(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long categoryId,
+            @PathVariable String languageCode,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok("Category translation saved successfully", menuAdminService.upsertCategoryTranslation(cafeteriaId, categoryId, languageCode, request));
+    }
+
+    @DeleteMapping("/categories/{categoryId}/translations/{languageCode}")
+    public ApiResponse<Void> deleteCategoryTranslation(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long categoryId,
+            @PathVariable String languageCode
+    ) {
+        menuAdminService.softDeleteCategoryTranslation(cafeteriaId, categoryId, languageCode);
+        return ApiResponse.ok("Category translation deleted successfully", null);
+    }
+
     @GetMapping("/products")
     public ApiResponse<List<Map<String, Object>>> listProducts(
             @PathVariable Long cafeteriaId,
@@ -143,6 +265,87 @@ public class MenuAdminController {
         return ApiResponse.ok("Product updated successfully", menuAdminService.updateProduct(cafeteriaId, productId, request));
     }
 
+    @PostMapping("/products/{productId}/image-upload-request")
+    public ApiResponse<PresignedMediaUpload> createProductImageUploadRequest(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId,
+            @RequestBody MediaUploadRequest request
+    ) {
+        return ApiResponse.ok(
+                "Product image upload request created successfully",
+                menuAdminService.createProductImageUpload(cafeteriaId, productId, request)
+        );
+    }
+
+    @PostMapping("/products/{productId}/image-assets/{assetId}/complete")
+    public ApiResponse<Map<String, Object>> completeProductImageUpload(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId,
+            @PathVariable UUID assetId,
+            @RequestBody(required = false) MediaCompleteRequest request
+    ) {
+        return ApiResponse.ok(
+                "Product image completed successfully",
+                menuAdminService.completeProductImageUpload(cafeteriaId, productId, assetId, request)
+        );
+    }
+
+    @GetMapping("/products/{productId}/images")
+    public ApiResponse<List<Map<String, Object>>> listProductImages(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId
+    ) {
+        return ApiResponse.ok("Product images found", menuAdminService.listProductImages(cafeteriaId, productId));
+    }
+
+    @PostMapping("/products/{productId}/images/upload-request")
+    public ApiResponse<PresignedMediaUpload> createProductGalleryImageUploadRequest(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId,
+            @RequestBody MediaUploadRequest request
+    ) {
+        return ApiResponse.ok(
+                "Product image upload request created successfully",
+                menuAdminService.createProductGalleryImageUpload(cafeteriaId, productId, request)
+        );
+    }
+
+    @PostMapping("/products/{productId}/images/{assetId}/complete")
+    public ApiResponse<Map<String, Object>> completeProductGalleryImageUpload(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId,
+            @PathVariable UUID assetId,
+            @RequestBody(required = false) MediaCompleteRequest request
+    ) {
+        return ApiResponse.ok(
+                "Product image completed successfully",
+                menuAdminService.completeProductImageUpload(cafeteriaId, productId, assetId, request)
+        );
+    }
+
+    @PutMapping("/products/{productId}/images/{productImageId}")
+    public ApiResponse<Map<String, Object>> updateProductImage(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId,
+            @PathVariable Long productImageId,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok(
+                "Product image updated successfully",
+                menuAdminService.updateProductImage(cafeteriaId, productId, productImageId, request)
+        );
+    }
+
+    @DeleteMapping("/products/{productId}/images/{productImageId}")
+    public ApiResponse<Void> deleteProductImage(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId,
+            @PathVariable Long productImageId
+    ) {
+        menuAdminService.softDeleteProductImage(cafeteriaId, productId, productImageId);
+        return ApiResponse.ok("Product image deleted successfully", null);
+    }
+
     @PutMapping("/products/{productId}/locations")
     public ApiResponse<List<Map<String, Object>>> assignProductLocations(
             @PathVariable Long cafeteriaId,
@@ -172,6 +375,62 @@ public class MenuAdminController {
     ) {
         menuAdminService.softDeleteProduct(cafeteriaId, productId);
         return ApiResponse.ok("Product deleted successfully", null);
+    }
+
+    @GetMapping("/products/{productId}/translations")
+    public ApiResponse<List<Map<String, Object>>> listProductTranslations(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId
+    ) {
+        return ApiResponse.ok("Product translations found", menuAdminService.listProductTranslations(cafeteriaId, productId));
+    }
+
+    @PutMapping("/products/{productId}/translations/{languageCode}")
+    public ApiResponse<Map<String, Object>> upsertProductTranslation(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId,
+            @PathVariable String languageCode,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok("Product translation saved successfully", menuAdminService.upsertProductTranslation(cafeteriaId, productId, languageCode, request));
+    }
+
+    @DeleteMapping("/products/{productId}/translations/{languageCode}")
+    public ApiResponse<Void> deleteProductTranslation(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId,
+            @PathVariable String languageCode
+    ) {
+        menuAdminService.softDeleteProductTranslation(cafeteriaId, productId, languageCode);
+        return ApiResponse.ok("Product translation deleted successfully", null);
+    }
+
+    @GetMapping("/products/{productId}/prices")
+    public ApiResponse<List<Map<String, Object>>> listProductPrices(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId
+    ) {
+        return ApiResponse.ok("Product prices found", menuAdminService.listProductPrices(cafeteriaId, productId));
+    }
+
+    @PutMapping("/products/{productId}/prices/{currencyCode}")
+    public ApiResponse<Map<String, Object>> upsertProductPrice(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId,
+            @PathVariable String currencyCode,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok("Product price saved successfully", menuAdminService.upsertProductPrice(cafeteriaId, productId, currencyCode, request));
+    }
+
+    @DeleteMapping("/products/{productId}/prices/{productPriceId}")
+    public ApiResponse<Void> deleteProductPrice(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId,
+            @PathVariable Long productPriceId
+    ) {
+        menuAdminService.softDeleteProductPrice(cafeteriaId, productId, productPriceId);
+        return ApiResponse.ok("Product price deleted successfully", null);
     }
 
     @GetMapping("/addon-groups")
@@ -213,6 +472,34 @@ public class MenuAdminController {
         return ApiResponse.ok("Addon group deleted successfully", null);
     }
 
+    @GetMapping("/addon-groups/{addonGroupId}/translations")
+    public ApiResponse<List<Map<String, Object>>> listAddonGroupTranslations(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long addonGroupId
+    ) {
+        return ApiResponse.ok("Addon group translations found", menuAdminService.listAddonGroupTranslations(cafeteriaId, addonGroupId));
+    }
+
+    @PutMapping("/addon-groups/{addonGroupId}/translations/{languageCode}")
+    public ApiResponse<Map<String, Object>> upsertAddonGroupTranslation(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long addonGroupId,
+            @PathVariable String languageCode,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok("Addon group translation saved successfully", menuAdminService.upsertAddonGroupTranslation(cafeteriaId, addonGroupId, languageCode, request));
+    }
+
+    @DeleteMapping("/addon-groups/{addonGroupId}/translations/{languageCode}")
+    public ApiResponse<Void> deleteAddonGroupTranslation(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long addonGroupId,
+            @PathVariable String languageCode
+    ) {
+        menuAdminService.softDeleteAddonGroupTranslation(cafeteriaId, addonGroupId, languageCode);
+        return ApiResponse.ok("Addon group translation deleted successfully", null);
+    }
+
     @GetMapping("/addons")
     public ApiResponse<List<Map<String, Object>>> listAddons(
             @PathVariable Long cafeteriaId,
@@ -248,6 +535,62 @@ public class MenuAdminController {
     ) {
         menuAdminService.softDeleteAddon(cafeteriaId, addonGroupId, addonId);
         return ApiResponse.ok("Addon deleted successfully", null);
+    }
+
+    @GetMapping("/addons/{addonId}/translations")
+    public ApiResponse<List<Map<String, Object>>> listAddonTranslations(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long addonId
+    ) {
+        return ApiResponse.ok("Addon translations found", menuAdminService.listAddonTranslations(cafeteriaId, addonId));
+    }
+
+    @PutMapping("/addons/{addonId}/translations/{languageCode}")
+    public ApiResponse<Map<String, Object>> upsertAddonTranslation(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long addonId,
+            @PathVariable String languageCode,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok("Addon translation saved successfully", menuAdminService.upsertAddonTranslation(cafeteriaId, addonId, languageCode, request));
+    }
+
+    @DeleteMapping("/addons/{addonId}/translations/{languageCode}")
+    public ApiResponse<Void> deleteAddonTranslation(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long addonId,
+            @PathVariable String languageCode
+    ) {
+        menuAdminService.softDeleteAddonTranslation(cafeteriaId, addonId, languageCode);
+        return ApiResponse.ok("Addon translation deleted successfully", null);
+    }
+
+    @GetMapping("/addons/{addonId}/prices")
+    public ApiResponse<List<Map<String, Object>>> listAddonPrices(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long addonId
+    ) {
+        return ApiResponse.ok("Addon prices found", menuAdminService.listAddonPrices(cafeteriaId, addonId));
+    }
+
+    @PutMapping("/addons/{addonId}/prices/{currencyCode}")
+    public ApiResponse<Map<String, Object>> upsertAddonPrice(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long addonId,
+            @PathVariable String currencyCode,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok("Addon price saved successfully", menuAdminService.upsertAddonPrice(cafeteriaId, addonId, currencyCode, request));
+    }
+
+    @DeleteMapping("/addons/{addonId}/prices/{addonPriceId}")
+    public ApiResponse<Void> deleteAddonPrice(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long addonId,
+            @PathVariable Long addonPriceId
+    ) {
+        menuAdminService.softDeleteAddonPrice(cafeteriaId, addonId, addonPriceId);
+        return ApiResponse.ok("Addon price deleted successfully", null);
     }
 
     @PutMapping("/locations/{locationId}/addons/{addonId}")

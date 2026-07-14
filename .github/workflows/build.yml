@@ -16,6 +16,7 @@ jobs:
     permissions:
       contents: read
       packages: read
+      id-token: write
 
     steps:
       - name: Checkout
@@ -36,44 +37,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload jar
-        if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-jar
-          path: target/kaffe-msa-menu-admin.jar
-          if-no-files-found: error
-
-  publish-image:
-    if: github.event_name == 'push'
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-      id-token: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download jar
-        uses: actions/download-artifact@v4
-        with:
-          name: app-jar
-          path: target
-
       - name: Configure AWS credentials
+        if: github.event_name == 'push'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::514422154879:role/KaffeGitHubActionsDeployRole
           aws-region: us-east-1
 
       - name: Login to Amazon ECR
+        if: github.event_name == 'push'
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push image
+        if: github.event_name == 'push'
         uses: docker/build-push-action@v6
         with:
           context: .
