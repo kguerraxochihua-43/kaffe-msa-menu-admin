@@ -40,7 +40,10 @@ with milk_defaults as (
     where g.deleted_at is null
       and a.deleted_at is null
       and g.name ilike 'tipo de leche'
-      and a.name ilike 'entera'
+      and (
+          a.name ilike 'entera'
+          or a.name ilike 'leche entera'
+      )
       and not exists (
           select 1
           from menu.lkp_addons existing_default
