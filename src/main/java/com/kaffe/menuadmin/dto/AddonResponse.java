@@ -7,6 +7,7 @@ public record AddonResponse(
         String name,
         String description,
         int price,
+        boolean isDefault,
         int sortOrder,
         boolean active
 ) {

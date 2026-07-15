@@ -19,6 +19,8 @@ public record CreateAddonRequest(
         @Min(0)
         Integer price,
 
+        Boolean isDefault,
+
         Integer sortOrder
 ) {
     public int effectivePrice() {
@@ -27,5 +29,9 @@ public record CreateAddonRequest(
 
     public int effectiveSortOrder() {
         return sortOrder == null ? 0 : sortOrder;
+    }
+
+    public boolean effectiveDefault() {
+        return isDefault != null && isDefault;
     }
 }

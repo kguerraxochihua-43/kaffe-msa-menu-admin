@@ -931,7 +931,10 @@ public class MenuAdminService {
     @Transactional
     public Map<String, Object> createAddonGroup(Long cafeteriaId, Map<String, Object> request) {
         requireTenantAccess(cafeteriaId, true);
-        validateSelection(request);
+        Boolean required = booleanValue(request.getOrDefault("required", false));
+        Integer minSelection = intValue(request.getOrDefault("minSelection", 0));
+        Integer maxSelection = nullableInt(request.get("maxSelection"));
+        validateSelection(required, minSelection, maxSelection);
         Long addonGroupId = jdbcTemplate.queryForObject("""
                         insert into menu.lkp_addon_groups (
                             tenant_id, name, description, min_selection, max_selection,
@@ -944,9 +947,9 @@ public class MenuAdminService {
                 cafeteriaId,
                 requiredString(request, "name"),
                 stringOrNull(request.get("description")),
-                intValue(request.getOrDefault("minSelection", 0)),
-                nullableInt(request.get("maxSelection")),
-                booleanValue(request.getOrDefault("required", false)),
+                minSelection,
+                maxSelection,
+                required,
                 intValue(request.getOrDefault("sortOrder", 0)),
                 booleanValue(request.getOrDefault("active", true)));
         return getAddonGroup(cafeteriaId, addonGroupId);
@@ -955,8 +958,15 @@ public class MenuAdminService {
     @Transactional
     public Map<String, Object> updateAddonGroup(Long cafeteriaId, Long addonGroupId, Map<String, Object> request) {
         requireTenantAccess(cafeteriaId, true);
-        ensureAddonGroup(cafeteriaId, addonGroupId);
-        validateSelection(request);
+        Map<String, Object> current = findAddonGroup(cafeteriaId, addonGroupId);
+        Boolean required = nullableBoolean(request.get("required"));
+        Integer minSelection = nullableInt(request.get("minSelection"));
+        Integer maxSelection = nullableInt(request.get("maxSelection"));
+        validateSelection(
+                required == null ? (Boolean) current.get("required") : required,
+                minSelection == null ? (Integer) current.get("minSelection") : minSelection,
+                maxSelection == null ? (Integer) current.get("maxSelection") : maxSelection
+        );
         jdbcTemplate.update("""
                         update menu.lkp_addon_groups
                         set name = coalesce(?, name),
@@ -1076,11 +1086,15 @@ public class MenuAdminService {
     public Map<String, Object> createAddon(Long cafeteriaId, Long addonGroupId, Map<String, Object> request) {
         requireTenantAccess(cafeteriaId, true);
         ensureAddonGroup(cafeteriaId, addonGroupId);
+        boolean isDefault = booleanValue(request.getOrDefault("isDefault", request.getOrDefault("default", false)));
+        if (isDefault) {
+            clearDefaultAddons(cafeteriaId, addonGroupId, null);
+        }
         Long addonId = jdbcTemplate.queryForObject("""
                         insert into menu.lkp_addons (
-                            tenant_id, addon_group_id, name, description, price, sort_order, is_active
+                            tenant_id, addon_group_id, name, description, price, sort_order, is_active, is_default
                         )
-                        values (?, ?, ?, ?, ?, ?, ?)
+                        values (?, ?, ?, ?, ?, ?, ?, ?)
                         returning addon_id
                         """,
                 Long.class,
@@ -1090,7 +1104,8 @@ public class MenuAdminService {
                 stringOrNull(request.get("description")),
                 intValue(request.getOrDefault("price", 0)),
                 intValue(request.getOrDefault("sortOrder", 0)),
-                booleanValue(request.getOrDefault("active", true)));
+                booleanValue(request.getOrDefault("active", true)),
+                isDefault);
         return findAddon(cafeteriaId, addonId);
     }
 
@@ -1098,6 +1113,10 @@ public class MenuAdminService {
     public Map<String, Object> updateAddon(Long cafeteriaId, Long addonGroupId, Long addonId, Map<String, Object> request) {
         requireTenantAccess(cafeteriaId, true);
         ensureAddon(cafeteriaId, addonGroupId, addonId);
+        Boolean isDefault = nullableBoolean(request.containsKey("isDefault") ? request.get("isDefault") : request.get("default"));
+        if (Boolean.TRUE.equals(isDefault)) {
+            clearDefaultAddons(cafeteriaId, addonGroupId, addonId);
+        }
         jdbcTemplate.update("""
                         update menu.lkp_addons
                         set name = coalesce(?, name),
@@ -1105,6 +1124,7 @@ public class MenuAdminService {
                             price = coalesce(?, price),
                             sort_order = coalesce(?, sort_order),
                             is_active = coalesce(?, is_active),
+                            is_default = coalesce(?, is_default),
                             updated_at = now()
                         where tenant_id = ?
                           and addon_group_id = ?
@@ -1116,6 +1136,7 @@ public class MenuAdminService {
                 nullableInt(request.get("price")),
                 nullableInt(request.get("sortOrder")),
                 nullableBoolean(request.get("active")),
+                isDefault,
                 cafeteriaId,
                 addonGroupId,
                 addonId);
@@ -1282,7 +1303,7 @@ public class MenuAdminService {
         if (maxSelection == null) {
             maxSelection = (Integer) addonGroup.get("maxSelection");
         }
-        validateSelection(minSelection, maxSelection);
+        validateSelection(required, minSelection, maxSelection);
         jdbcTemplate.update("""
                         insert into menu.product_addon_groups (
                             product_id, tenant_id, addon_group_id, sort_order, is_active,
@@ -2741,6 +2762,7 @@ public class MenuAdminService {
                 "name", rs.getString("name"),
                 "description", rs.getString("description"),
                 "price", rs.getInt("price"),
+                "isDefault", rs.getBoolean("is_default"),
                 "sortOrder", rs.getInt("sort_order"),
                 "active", rs.getBoolean("is_active")
         );
@@ -2788,6 +2810,28 @@ public class MenuAdminService {
         );
     }
 
+    private void clearDefaultAddons(Long cafeteriaId, Long addonGroupId, Long exceptAddonId) {
+        List<Object> params = new ArrayList<>();
+        params.add(cafeteriaId);
+        params.add(addonGroupId);
+        String exceptSql = "";
+        if (exceptAddonId != null) {
+            exceptSql = " and addon_id <> ?";
+            params.add(exceptAddonId);
+        }
+        jdbcTemplate.update("""
+                        update menu.lkp_addons
+                        set is_default = false,
+                            updated_at = now()
+                        where tenant_id = ?
+                          and addon_group_id = ?
+                          and is_default = true
+                          and deleted_at is null
+                        %s
+                        """.formatted(exceptSql),
+                params.toArray());
+    }
+
     private <T> T queryOne(String sql, RowMapperOne<T> mapper, Object... args) {
         try {
             return jdbcTemplate.queryForObject(sql, (rs, rowNum) -> mapper.map(rs), args);
@@ -2799,10 +2843,11 @@ public class MenuAdminService {
     private void validateSelection(Map<String, Object> request) {
         Integer min = nullableInt(request.get("minSelection"));
         Integer max = nullableInt(request.get("maxSelection"));
-        validateSelection(min, max);
+        Boolean required = nullableBoolean(request.get("required"));
+        validateSelection(required, min, max);
     }
 
-    private void validateSelection(Integer min, Integer max) {
+    private void validateSelection(Boolean required, Integer min, Integer max) {
         if (min != null && min < 0) {
             throw new BadRequestException("minSelection must be greater than or equal to zero");
         }
@@ -2811,6 +2856,9 @@ public class MenuAdminService {
         }
         if (min != null && max != null && max < min) {
             throw new BadRequestException("maxSelection must be greater than or equal to minSelection");
+        }
+        if (Boolean.TRUE.equals(required) && min != null && min < 1) {
+            throw new BadRequestException("required addon groups must have minSelection greater than zero");
         }
     }
 
