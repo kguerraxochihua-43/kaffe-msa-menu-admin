@@ -60,3 +60,15 @@ set is_default = true,
 from milk_defaults md
 where a.addon_id = md.addon_id
   and md.rn = 1;
+
+update menu.product_addon_groups pag
+set is_required = true,
+    min_selection = 1,
+    max_selection = 1,
+    updated_at = now()
+from menu.lkp_addon_groups g
+where g.addon_group_id = pag.addon_group_id
+  and g.tenant_id = pag.tenant_id
+  and g.deleted_at is null
+  and pag.deleted_at is null
+  and g.name ilike 'tipo de leche';
