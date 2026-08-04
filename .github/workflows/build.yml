@@ -32,8 +32,8 @@ jobs:
           server-username: GITHUB_ACTOR
           server-password: GITHUB_TOKEN
 
-      - name: Build
-        run: mvn -B package -DskipTests
+      - name: Test and build
+        run: mvn -B verify
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

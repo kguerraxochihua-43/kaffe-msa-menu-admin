@@ -10,6 +10,7 @@ import com.kaffe.common.media.MediaUploadPolicy;
 import com.kaffe.common.media.MediaUploadRequest;
 import com.kaffe.common.media.PresignedMediaUpload;
 import com.kaffe.common.security.CurrentUserProvider;
+import com.kaffe.menuadmin.dto.MenuCatalogResponse;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -33,10 +34,9 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class MenuAdminService {
 
-    private static final List<String> MANAGER_ROLES = List.of(
-            "owner", "multi_location_owner", "admin", "manager", "location_manager"
-    );
     private static final String PURPOSE_MENU_PRODUCT_IMAGE = "menu-product-image";
+    private static final String POLICY_MENU_READ = "menu:read";
+    private static final String POLICY_MENU_WRITE = "menu:write";
 
     private final JdbcTemplate jdbcTemplate;
     private final CurrentUserProvider currentUserProvider;
@@ -44,6 +44,124 @@ public class MenuAdminService {
 
     @org.springframework.beans.factory.annotation.Value("${kaffe.auth.schema:kaffe_auth}")
     private String authSchema = "auth";
+
+    @Transactional(readOnly = true)
+    public MenuCatalogResponse getCatalog(Long cafeteriaId, Long locationId) {
+        if (locationId == null) {
+            requireTenantAccess(cafeteriaId, false);
+        } else {
+            requireLocationAccess(cafeteriaId, locationId, false);
+        }
+
+        List<Map<String, Object>> categories = jdbcTemplate.query("""
+                        select *
+                        from menu.categories
+                        where tenant_id = ?
+                          and deleted_at is null
+                        order by sort_order asc, name asc
+                        """,
+                (rs, rowNum) -> categoryRow(rs),
+                cafeteriaId);
+
+        List<Map<String, Object>> products = jdbcTemplate.query("""
+                        select p.*, c.name as category_name,
+                               lp.location_product_id,
+                               lp.price_override,
+                               lp.is_available as location_available,
+                               lp.is_featured as location_featured,
+                               lp.sort_order as location_sort_order
+                        from menu.products p
+                        left join menu.categories c on c.category_id = p.category_id
+                        left join menu.location_products lp
+                          on lp.tenant_id = p.tenant_id
+                         and lp.product_id = p.product_id
+                         and lp.location_id = ?
+                         and lp.deleted_at is null
+                        where p.tenant_id = ?
+                          and p.deleted_at is null
+                        order by c.sort_order nulls last,
+                                 coalesce(lp.sort_order, p.sort_order) asc,
+                                 p.name asc
+                        """,
+                (rs, rowNum) -> catalogProductRow(rs),
+                locationId,
+                cafeteriaId);
+
+        List<Map<String, Object>> addonGroups = jdbcTemplate.query("""
+                        select *
+                        from menu.lkp_addon_groups
+                        where tenant_id = ?
+                          and deleted_at is null
+                        order by sort_order asc, name asc
+                        """,
+                (rs, rowNum) -> addonGroupRow(rs),
+                cafeteriaId);
+
+        List<Map<String, Object>> addons = jdbcTemplate.query("""
+                        select a.*, g.name as addon_group_name,
+                               la.location_addon_id,
+                               la.is_available as location_available,
+                               la.price_override
+                        from menu.lkp_addons a
+                        join menu.lkp_addon_groups g on g.addon_group_id = a.addon_group_id
+                        left join menu.location_addons la
+                          on la.tenant_id = a.tenant_id
+                         and la.addon_id = a.addon_id
+                         and la.location_id = ?
+                         and la.deleted_at is null
+                        where a.tenant_id = ?
+                          and a.deleted_at is null
+                          and g.deleted_at is null
+                        order by g.sort_order asc, a.sort_order asc, a.name asc
+                        """,
+                (rs, rowNum) -> catalogAddonRow(rs),
+                locationId,
+                cafeteriaId);
+
+        List<Map<String, Object>> productAddonGroups = jdbcTemplate.query("""
+                        select pag.*, g.name as addon_group_name
+                        from menu.product_addon_groups pag
+                        join menu.lkp_addon_groups g on g.addon_group_id = pag.addon_group_id
+                        join menu.products p on p.product_id = pag.product_id
+                        where pag.tenant_id = ?
+                          and pag.deleted_at is null
+                          and pag.is_active = true
+                          and g.deleted_at is null
+                          and p.deleted_at is null
+                        order by pag.product_id, pag.sort_order, g.name
+                        """,
+                (rs, rowNum) -> productAddonGroupRow(rs),
+                cafeteriaId);
+
+        long availableProducts = products.stream()
+                .filter(product -> Boolean.TRUE.equals(product.get("effectiveAvailable")))
+                .count();
+        long featuredProducts = products.stream()
+                .filter(product -> Boolean.TRUE.equals(product.get("effectiveFeatured")))
+                .count();
+        long productsWithoutImage = products.stream()
+                .filter(product -> product.get("imageUrl") == null)
+                .count();
+
+        return new MenuCatalogResponse(
+                cafeteriaId,
+                locationId,
+                row(
+                        "categoryCount", categories.size(),
+                        "productCount", products.size(),
+                        "availableProductCount", availableProducts,
+                        "featuredProductCount", featuredProducts,
+                        "productsWithoutImageCount", productsWithoutImage,
+                        "addonGroupCount", addonGroups.size(),
+                        "addonCount", addons.size()
+                ),
+                categories,
+                products,
+                addonGroups,
+                addons,
+                productAddonGroups
+        );
+    }
 
     public Map<String, Object> getMenuSettings(Long cafeteriaId) {
         requireTenantAccess(cafeteriaId, false);
@@ -489,6 +607,7 @@ public class MenuAdminService {
 
     @Transactional
     public Map<String, Object> createCategory(Long cafeteriaId, Map<String, Object> request) {
+        MenuAdminRules.validateCategory(request, true);
         requireTenantAccess(cafeteriaId, true);
         Long categoryId = jdbcTemplate.queryForObject("""
                         insert into menu.categories (tenant_id, name, description, sort_order, is_active)
@@ -510,6 +629,7 @@ public class MenuAdminService {
 
     @Transactional
     public Map<String, Object> updateCategory(Long cafeteriaId, Long categoryId, Map<String, Object> request) {
+        MenuAdminRules.validateCategory(request, false);
         requireTenantAccess(cafeteriaId, true);
         ensureCategory(cafeteriaId, categoryId);
         jdbcTemplate.update("""
@@ -749,6 +869,7 @@ public class MenuAdminService {
 
     @Transactional
     public Map<String, Object> createProduct(Long cafeteriaId, Map<String, Object> request) {
+        MenuAdminRules.validateProduct(request, true);
         requireTenantAccess(cafeteriaId, true);
         Long categoryId = nullableLong(request.get("categoryId"));
         if (categoryId != null) {
@@ -784,6 +905,7 @@ public class MenuAdminService {
 
     @Transactional
     public Map<String, Object> updateProduct(Long cafeteriaId, Long productId, Map<String, Object> request) {
+        MenuAdminRules.validateProduct(request, false);
         requireTenantAccess(cafeteriaId, true);
         ensureProduct(cafeteriaId, productId);
         Long categoryId = nullableLong(request.get("categoryId"));
@@ -930,6 +1052,7 @@ public class MenuAdminService {
 
     @Transactional
     public Map<String, Object> createAddonGroup(Long cafeteriaId, Map<String, Object> request) {
+        MenuAdminRules.validateAddonGroup(request, true);
         requireTenantAccess(cafeteriaId, true);
         Boolean required = booleanValue(request.getOrDefault("required", false));
         Integer minSelection = intValue(request.getOrDefault("minSelection", 0));
@@ -957,6 +1080,7 @@ public class MenuAdminService {
 
     @Transactional
     public Map<String, Object> updateAddonGroup(Long cafeteriaId, Long addonGroupId, Map<String, Object> request) {
+        MenuAdminRules.validateAddonGroup(request, false);
         requireTenantAccess(cafeteriaId, true);
         Map<String, Object> current = findAddonGroup(cafeteriaId, addonGroupId);
         Boolean required = nullableBoolean(request.get("required"));
@@ -1084,6 +1208,7 @@ public class MenuAdminService {
 
     @Transactional
     public Map<String, Object> createAddon(Long cafeteriaId, Long addonGroupId, Map<String, Object> request) {
+        MenuAdminRules.validateAddon(request, true);
         requireTenantAccess(cafeteriaId, true);
         ensureAddonGroup(cafeteriaId, addonGroupId);
         boolean isDefault = booleanValue(request.getOrDefault("isDefault", request.getOrDefault("default", false)));
@@ -1111,6 +1236,7 @@ public class MenuAdminService {
 
     @Transactional
     public Map<String, Object> updateAddon(Long cafeteriaId, Long addonGroupId, Long addonId, Map<String, Object> request) {
+        MenuAdminRules.validateAddon(request, false);
         requireTenantAccess(cafeteriaId, true);
         ensureAddon(cafeteriaId, addonGroupId, addonId);
         Boolean isDefault = nullableBoolean(request.containsKey("isDefault") ? request.get("isDefault") : request.get("default"));
@@ -1219,7 +1345,8 @@ public class MenuAdminService {
 
     @Transactional
     public Map<String, Object> configureLocationProduct(Long cafeteriaId, Long locationId, Long productId, Map<String, Object> request) {
-        requireTenantAccess(cafeteriaId, true);
+        MenuAdminRules.validateLocationConfiguration(request);
+        requireLocationAccess(cafeteriaId, locationId, true);
         ensureLocation(cafeteriaId, locationId);
         ensureProduct(cafeteriaId, productId);
         Long locationProductId = jdbcTemplate.queryForObject("""
@@ -1259,7 +1386,8 @@ public class MenuAdminService {
 
     @Transactional
     public Map<String, Object> configureLocationAddon(Long cafeteriaId, Long locationId, Long addonId, Map<String, Object> request) {
-        requireTenantAccess(cafeteriaId, true);
+        MenuAdminRules.validateLocationConfiguration(request);
+        requireLocationAccess(cafeteriaId, locationId, true);
         ensureLocation(cafeteriaId, locationId);
         ensureAddon(cafeteriaId, addonId);
         Long locationAddonId = jdbcTemplate.queryForObject("""
@@ -1626,11 +1754,27 @@ public class MenuAdminService {
         Long userId = currentUserProvider.requireUserId();
         try {
             Membership membership = jdbcTemplate.queryForObject(authSql("""
-                            select tu.user_id, tu.tenant_id, r.code as role_code
-                            from auth.tenant_users tu
-                            join catalog.lkp_roles r on r.role_id = tu.role_id
-                            where tu.user_id = ?
-                              and tu.tenant_id = ?
+                            select ura.user_id, ura.tenant_id, tr.code as role_code
+                            from auth.tenant_user_role_assignments ura
+                            join auth.tenant_roles tr
+                              on tr.tenant_role_id = ura.tenant_role_id
+                             and tr.tenant_id = ura.tenant_id
+                             and tr.status_id = 1
+                            join auth.tenant_role_policies trp
+                              on trp.tenant_role_id = tr.tenant_role_id
+                             and trp.enabled = true
+                            join catalog.lkp_policies p
+                              on p.policy_id = trp.policy_id
+                             and p.status_id = 1
+                            where ura.user_id = ?
+                              and ura.tenant_id = ?
+                              and ura.status_id = 1
+                              and (
+                                  (? = true and ura.location_id is null and p.code = ?)
+                                  or
+                                  (? = false and p.code in (?, ?))
+                              )
+                            order by ura.is_default desc, ura.created_at desc
                             limit 1
                             """),
                     (rs, rowNum) -> new Membership(
@@ -1639,14 +1783,101 @@ public class MenuAdminService {
                             rs.getString("role_code")
                     ),
                     userId,
-                    cafeteriaId);
-            if (managerRequired && !MANAGER_ROLES.contains(membership.roleCode())) {
-                throw new ForbiddenException("User cannot manage menu for this cafeteria");
-            }
+                    cafeteriaId,
+                    managerRequired,
+                    POLICY_MENU_WRITE,
+                    managerRequired,
+                    POLICY_MENU_READ,
+                    POLICY_MENU_WRITE);
             return membership;
         } catch (EmptyResultDataAccessException ex) {
-            throw new ResourceNotFoundException("Cafeteria was not found for this user");
+            throwMenuAccess(cafeteriaId, null, managerRequired);
+            throw ex;
         }
+    }
+
+    private Membership requireLocationAccess(Long cafeteriaId, Long locationId, boolean writeRequired) {
+        Long userId = currentUserProvider.requireUserId();
+        try {
+            return jdbcTemplate.queryForObject(authSql("""
+                            select ura.user_id, ura.tenant_id, tr.code as role_code
+                            from auth.tenant_user_role_assignments ura
+                            join auth.tenant_roles tr
+                              on tr.tenant_role_id = ura.tenant_role_id
+                             and tr.tenant_id = ura.tenant_id
+                             and tr.status_id = 1
+                            join auth.tenant_role_policies trp
+                              on trp.tenant_role_id = tr.tenant_role_id
+                             and trp.enabled = true
+                            join catalog.lkp_policies p
+                              on p.policy_id = trp.policy_id
+                             and p.status_id = 1
+                            join core.locations l
+                              on l.tenant_id = ura.tenant_id
+                             and l.location_id = ?
+                             and l.status_id <> 4
+                            where ura.user_id = ?
+                              and ura.tenant_id = ?
+                              and ura.status_id = 1
+                              and (ura.location_id is null or ura.location_id = l.location_id)
+                              and (
+                                  (? = true and p.code = ?)
+                                  or
+                                  (? = false and p.code in (?, ?))
+                              )
+                            order by
+                                case when ura.location_id = l.location_id then 0 else 1 end,
+                                ura.is_default desc,
+                                ura.created_at desc
+                            limit 1
+                            """),
+                    (rs, rowNum) -> new Membership(
+                            rs.getLong("user_id"),
+                            rs.getLong("tenant_id"),
+                            rs.getString("role_code")
+                    ),
+                    locationId,
+                    userId,
+                    cafeteriaId,
+                    writeRequired,
+                    POLICY_MENU_WRITE,
+                    writeRequired,
+                    POLICY_MENU_READ,
+                    POLICY_MENU_WRITE);
+        } catch (EmptyResultDataAccessException ex) {
+            throwMenuAccess(cafeteriaId, locationId, writeRequired);
+            throw ex;
+        }
+    }
+
+    private void throwMenuAccess(Long cafeteriaId, Long locationId, boolean writeRequired) {
+        Long userId = currentUserProvider.requireUserId();
+        String locationScope = locationId == null
+                ? ""
+                : "and (location_id is null or location_id = ?)";
+        Object[] args = locationId == null
+                ? new Object[]{userId, cafeteriaId}
+                : new Object[]{userId, cafeteriaId, locationId};
+        Boolean assigned = jdbcTemplate.queryForObject(authSql("""
+                        select exists(
+                            select 1
+                            from auth.tenant_user_role_assignments
+                            where user_id = ?
+                              and tenant_id = ?
+                              and status_id = 1
+                              %s
+                        )
+                        """.formatted(locationScope)),
+                Boolean.class,
+                args);
+        if (Boolean.TRUE.equals(assigned)) {
+            throw new ForbiddenException(writeRequired
+                    ? "User cannot manage menu in this scope"
+                    : "User cannot read menu in this scope");
+        }
+        throw new ResourceNotFoundException(locationId == null
+                ? "Cafeteria was not found for this user"
+                : "Location was not found for this user");
     }
 
     private void ensureMenu(Long cafeteriaId, Long menuId) {
@@ -2489,6 +2720,32 @@ public class MenuAdminService {
         );
     }
 
+    private Map<String, Object> catalogProductRow(ResultSet rs) throws SQLException {
+        Map<String, Object> product = productRow(rs);
+        Long locationProductId = nullableColumnLong(rs, "location_product_id");
+        Integer priceOverride = nullableColumnInt(rs, "price_override");
+        boolean globalAvailable = Boolean.TRUE.equals(product.get("available"));
+        boolean globalFeatured = Boolean.TRUE.equals(product.get("featured"));
+        boolean locationConfigured = locationProductId != null;
+        boolean effectiveAvailable = globalAvailable
+                && (!locationConfigured || rs.getBoolean("location_available"));
+        boolean effectiveFeatured = locationConfigured
+                ? rs.getBoolean("location_featured")
+                : globalFeatured;
+        int effectiveSortOrder = locationConfigured
+                ? rs.getInt("location_sort_order")
+                : (Integer) product.get("sortOrder");
+
+        product.put("locationProductId", locationProductId);
+        product.put("locationConfigured", locationConfigured);
+        product.put("priceOverride", priceOverride);
+        product.put("effectivePrice", priceOverride == null ? product.get("basePrice") : priceOverride);
+        product.put("effectiveAvailable", effectiveAvailable);
+        product.put("effectiveFeatured", effectiveFeatured);
+        product.put("effectiveSortOrder", effectiveSortOrder);
+        return product;
+    }
+
     private Map<String, Object> productImageRow(ResultSet rs) throws SQLException {
         return row(
                 "productImageId", rs.getLong("product_image_id"),
@@ -2766,6 +3023,21 @@ public class MenuAdminService {
                 "sortOrder", rs.getInt("sort_order"),
                 "active", rs.getBoolean("is_active")
         );
+    }
+
+    private Map<String, Object> catalogAddonRow(ResultSet rs) throws SQLException {
+        Map<String, Object> addon = addonRow(rs);
+        Long locationAddonId = nullableColumnLong(rs, "location_addon_id");
+        Integer priceOverride = nullableColumnInt(rs, "price_override");
+        boolean globalAvailable = Boolean.TRUE.equals(addon.get("active"));
+        boolean effectiveAvailable = globalAvailable
+                && (locationAddonId == null || rs.getBoolean("location_available"));
+        addon.put("locationAddonId", locationAddonId);
+        addon.put("locationConfigured", locationAddonId != null);
+        addon.put("priceOverride", priceOverride);
+        addon.put("effectivePrice", priceOverride == null ? addon.get("price") : priceOverride);
+        addon.put("effectiveAvailable", effectiveAvailable);
+        return addon;
     }
 
     private Map<String, Object> productAddonGroupRow(ResultSet rs) throws SQLException {

@@ -5,6 +5,7 @@ import com.kaffe.common.media.MediaCompleteRequest;
 import com.kaffe.common.media.MediaUploadRequest;
 import com.kaffe.common.media.PresignedMediaUpload;
 import com.kaffe.menuadmin.service.MenuAdminService;
+import com.kaffe.menuadmin.dto.MenuCatalogResponse;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -26,6 +27,14 @@ import java.util.UUID;
 public class MenuAdminController {
 
     private final MenuAdminService menuAdminService;
+
+    @GetMapping("/catalog")
+    public ApiResponse<MenuCatalogResponse> getCatalog(
+            @PathVariable Long cafeteriaId,
+            @RequestParam(required = false) Long locationId
+    ) {
+        return ApiResponse.ok("Menu catalog found", menuAdminService.getCatalog(cafeteriaId, locationId));
+    }
 
     @GetMapping("/settings/menu")
     public ApiResponse<Map<String, Object>> getMenuSettings(@PathVariable Long cafeteriaId) {
