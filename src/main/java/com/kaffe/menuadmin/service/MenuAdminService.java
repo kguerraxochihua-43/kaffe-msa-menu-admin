@@ -623,6 +623,8 @@ public class MenuAdminService {
 
         if (request.containsKey("menuIds")) {
             replaceCategoryMenus(cafeteriaId, categoryId, longList(request.get("menuIds")));
+        } else {
+            ensureDefaultPublicationForCategory(cafeteriaId, categoryId);
         }
         return findCategory(cafeteriaId, categoryId);
     }
@@ -1513,6 +1515,64 @@ public class MenuAdminService {
                     locationId);
         }
         deactivateRemovedMenuLocations(cafeteriaId, menuId, locationIds);
+    }
+
+    private void ensureDefaultPublicationForCategory(Long cafeteriaId, Long categoryId) {
+        // Serialize first-menu provisioning for a tenant without holding a table-level lock.
+        jdbcTemplate.query(
+                "select pg_advisory_xact_lock(?)",
+                resultSet -> null,
+                830_000_000_000L + cafeteriaId
+        );
+
+        Long menuId = jdbcTemplate.query("""
+                        select menu_id
+                        from menu.menus
+                        where tenant_id = ?
+                          and is_global = true
+                          and is_active = true
+                          and deleted_at is null
+                        order by sort_order asc, menu_id asc
+                        limit 1
+                        """,
+                resultSet -> resultSet.next()
+                        ? resultSet.getObject("menu_id", Long.class)
+                        : null,
+                cafeteriaId);
+
+        if (menuId == null) {
+            menuId = jdbcTemplate.queryForObject("""
+                            insert into menu.menus (
+                                tenant_id, name, description, is_global, is_active, sort_order
+                            )
+                            values (?, 'Menú principal', null, true, true, 0)
+                            returning menu_id
+                            """,
+                    Long.class,
+                    cafeteriaId);
+        }
+
+        jdbcTemplate.update("""
+                        insert into menu.menu_categories (
+                            menu_id, tenant_id, category_id, sort_order, is_active,
+                            deleted_at, deleted_by_user_id
+                        )
+                        select ?, ?, ?, coalesce(max(sort_order), 0) + 1, true, null, null
+                        from menu.menu_categories
+                        where menu_id = ?
+                          and tenant_id = ?
+                          and deleted_at is null
+                        on conflict (menu_id, category_id) do update set
+                            is_active = true,
+                            deleted_at = null,
+                            deleted_by_user_id = null,
+                            updated_at = now()
+                        """,
+                menuId,
+                cafeteriaId,
+                categoryId,
+                menuId,
+                cafeteriaId);
     }
 
     private void updateProductLocations(Long cafeteriaId, Long productId, Map<String, Object> request) {
