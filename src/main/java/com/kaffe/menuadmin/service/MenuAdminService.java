@@ -1851,6 +1851,10 @@ public class MenuAdminService {
     }
 
     private void throwMenuAccess(Long cafeteriaId, Long locationId, boolean writeRequired) {
+        if (locationId != null) {
+            ensureLocationExistsForAccess(cafeteriaId, locationId);
+        }
+
         Long userId = currentUserProvider.requireUserId();
         String locationScope = locationId == null
                 ? ""
@@ -1878,6 +1882,24 @@ public class MenuAdminService {
         throw new ResourceNotFoundException(locationId == null
                 ? "Cafeteria was not found for this user"
                 : "Location was not found for this user");
+    }
+
+    private void ensureLocationExistsForAccess(Long cafeteriaId, Long locationId) {
+        Boolean exists = jdbcTemplate.queryForObject("""
+                        select exists(
+                            select 1
+                            from core.locations
+                            where tenant_id = ?
+                              and location_id = ?
+                              and status_id <> 4
+                        )
+                        """,
+                Boolean.class,
+                cafeteriaId,
+                locationId);
+        if (!Boolean.TRUE.equals(exists)) {
+            throw new ResourceNotFoundException("Location was not found for this cafeteria");
+        }
     }
 
     private void ensureMenu(Long cafeteriaId, Long menuId) {

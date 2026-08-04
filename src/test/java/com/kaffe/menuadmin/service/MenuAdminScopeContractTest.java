@@ -22,6 +22,8 @@ class MenuAdminScopeContractTest {
                 .contains("tenant_user_role_assignments")
                 .contains("tenant_role_policies")
                 .contains("ura.location_id is null or ura.location_id = l.location_id")
+                .contains("ensureLocationExistsForAccess(cafeteriaId, locationId)")
+                .contains("Location was not found for this cafeteria")
                 .doesNotContain("MANAGER_ROLES");
     }
 }
