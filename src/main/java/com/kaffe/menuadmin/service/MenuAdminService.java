@@ -1,6 +1,7 @@
 package com.kaffe.menuadmin.service;
 
 import com.kaffe.common.exception.BadRequestException;
+import com.kaffe.common.exception.ConflictException;
 import com.kaffe.common.exception.ForbiddenException;
 import com.kaffe.common.exception.ResourceNotFoundException;
 import com.kaffe.common.media.MediaAsset;
@@ -10,8 +11,11 @@ import com.kaffe.common.media.MediaUploadPolicy;
 import com.kaffe.common.media.MediaUploadRequest;
 import com.kaffe.common.media.PresignedMediaUpload;
 import com.kaffe.common.security.CurrentUserProvider;
+import com.kaffe.menuadmin.dto.CheckoutRecommendationRequest;
+import com.kaffe.menuadmin.dto.CheckoutRecommendationResponse;
 import com.kaffe.menuadmin.dto.MenuCatalogResponse;
 import lombok.RequiredArgsConstructor;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -161,6 +165,158 @@ public class MenuAdminService {
                 addons,
                 productAddonGroups
         );
+    }
+
+    @Transactional(readOnly = true)
+    public List<CheckoutRecommendationResponse> listCheckoutRecommendations(Long cafeteriaId, Long locationId) {
+        if (locationId == null) {
+            requireTenantAccess(cafeteriaId, false);
+        } else {
+            requireLocationAccess(cafeteriaId, locationId, false);
+        }
+
+        List<Object> params = new ArrayList<>();
+        params.add(cafeteriaId);
+        if (locationId != null) {
+            params.add(locationId);
+        }
+        return jdbcTemplate.query("""
+                        select
+                            r.*,
+                            l.name as location_name,
+                            p.name as product_name,
+                            tp.name as trigger_product_name
+                        from menu.checkout_recommendations r
+                        left join core.locations l
+                          on l.location_id = r.location_id
+                         and l.tenant_id = r.tenant_id
+                        join menu.products p
+                          on p.product_id = r.product_id
+                         and p.tenant_id = r.tenant_id
+                        left join menu.products tp
+                          on tp.product_id = r.trigger_product_id
+                         and tp.tenant_id = r.tenant_id
+                        where r.tenant_id = ?
+                          and r.deleted_at is null
+                          %s
+                        order by r.location_id nulls first, r.priority asc, r.checkout_recommendation_id asc
+                        """.formatted(locationId == null ? "" : "and (r.location_id is null or r.location_id = ?)"),
+                (rs, rowNum) -> checkoutRecommendationRow(rs),
+                params.toArray());
+    }
+
+    @Transactional(readOnly = true)
+    public CheckoutRecommendationResponse getCheckoutRecommendation(Long cafeteriaId, Long recommendationId) {
+        requireTenantAccess(cafeteriaId, false);
+        return findCheckoutRecommendation(cafeteriaId, recommendationId);
+    }
+
+    @Transactional
+    public CheckoutRecommendationResponse createCheckoutRecommendation(
+            Long cafeteriaId,
+            CheckoutRecommendationRequest request
+    ) {
+        Membership membership = requireRecommendationWriteAccess(cafeteriaId, request.locationId());
+        validateCheckoutRecommendation(cafeteriaId, request);
+        try {
+            Long recommendationId = jdbcTemplate.queryForObject("""
+                            insert into menu.checkout_recommendations (
+                                tenant_id,
+                                location_id,
+                                product_id,
+                                trigger_product_id,
+                                message,
+                                priority,
+                                starts_at,
+                                ends_at,
+                                is_active,
+                                created_by_user_id,
+                                updated_by_user_id
+                            )
+                            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            returning checkout_recommendation_id
+                            """,
+                    Long.class,
+                    cafeteriaId,
+                    request.locationId(),
+                    request.productId(),
+                    request.triggerProductId(),
+                    normalizeRecommendationMessage(request.message()),
+                    request.priority() == null ? 100 : request.priority(),
+                    request.startsAt(),
+                    request.endsAt(),
+                    request.active() == null || request.active(),
+                    membership.userId(),
+                    membership.userId());
+            return findCheckoutRecommendation(cafeteriaId, recommendationId);
+        } catch (DuplicateKeyException ex) {
+            throw new ConflictException("An equivalent checkout recommendation already exists");
+        }
+    }
+
+    @Transactional
+    public CheckoutRecommendationResponse updateCheckoutRecommendation(
+            Long cafeteriaId,
+            Long recommendationId,
+            CheckoutRecommendationRequest request
+    ) {
+        CheckoutRecommendationResponse current = getCheckoutRecommendation(cafeteriaId, recommendationId);
+        requireRecommendationWriteAccess(cafeteriaId, current.locationId());
+        Membership membership = requireRecommendationWriteAccess(cafeteriaId, request.locationId());
+        validateCheckoutRecommendation(cafeteriaId, request);
+        try {
+            jdbcTemplate.update("""
+                            update menu.checkout_recommendations
+                            set location_id = ?,
+                                product_id = ?,
+                                trigger_product_id = ?,
+                                message = ?,
+                                priority = ?,
+                                starts_at = ?,
+                                ends_at = ?,
+                                is_active = ?,
+                                updated_by_user_id = ?,
+                                updated_at = now()
+                            where tenant_id = ?
+                              and checkout_recommendation_id = ?
+                              and deleted_at is null
+                            """,
+                    request.locationId(),
+                    request.productId(),
+                    request.triggerProductId(),
+                    normalizeRecommendationMessage(request.message()),
+                    request.priority() == null ? 100 : request.priority(),
+                    request.startsAt(),
+                    request.endsAt(),
+                    request.active() == null || request.active(),
+                    membership.userId(),
+                    cafeteriaId,
+                    recommendationId);
+            return findCheckoutRecommendation(cafeteriaId, recommendationId);
+        } catch (DuplicateKeyException ex) {
+            throw new ConflictException("An equivalent checkout recommendation already exists");
+        }
+    }
+
+    @Transactional
+    public void softDeleteCheckoutRecommendation(Long cafeteriaId, Long recommendationId) {
+        CheckoutRecommendationResponse current = getCheckoutRecommendation(cafeteriaId, recommendationId);
+        Membership membership = requireRecommendationWriteAccess(cafeteriaId, current.locationId());
+        jdbcTemplate.update("""
+                        update menu.checkout_recommendations
+                        set is_active = false,
+                            deleted_at = now(),
+                            deleted_by_user_id = ?,
+                            updated_by_user_id = ?,
+                            updated_at = now()
+                        where tenant_id = ?
+                          and checkout_recommendation_id = ?
+                          and deleted_at is null
+                        """,
+                membership.userId(),
+                membership.userId(),
+                cafeteriaId,
+                recommendationId);
     }
 
     public Map<String, Object> getMenuSettings(Long cafeteriaId) {
@@ -2082,6 +2238,88 @@ public class MenuAdminService {
                 rs -> productRow(rs),
                 cafeteriaId,
                 productId);
+    }
+
+    private CheckoutRecommendationResponse findCheckoutRecommendation(Long cafeteriaId, Long recommendationId) {
+        try {
+            return jdbcTemplate.queryForObject("""
+                            select
+                                r.*,
+                                l.name as location_name,
+                                p.name as product_name,
+                                tp.name as trigger_product_name
+                            from menu.checkout_recommendations r
+                            left join core.locations l
+                              on l.location_id = r.location_id
+                             and l.tenant_id = r.tenant_id
+                            join menu.products p
+                              on p.product_id = r.product_id
+                             and p.tenant_id = r.tenant_id
+                            left join menu.products tp
+                              on tp.product_id = r.trigger_product_id
+                             and tp.tenant_id = r.tenant_id
+                            where r.tenant_id = ?
+                              and r.checkout_recommendation_id = ?
+                              and r.deleted_at is null
+                            """,
+                    (rs, rowNum) -> checkoutRecommendationRow(rs),
+                    cafeteriaId,
+                    recommendationId);
+        } catch (EmptyResultDataAccessException ex) {
+            throw new ResourceNotFoundException("Checkout recommendation was not found");
+        }
+    }
+
+    private CheckoutRecommendationResponse checkoutRecommendationRow(ResultSet rs) throws SQLException {
+        return new CheckoutRecommendationResponse(
+                rs.getLong("checkout_recommendation_id"),
+                rs.getLong("tenant_id"),
+                rs.getObject("location_id", Long.class),
+                rs.getString("location_name"),
+                rs.getLong("product_id"),
+                rs.getString("product_name"),
+                rs.getObject("trigger_product_id", Long.class),
+                rs.getString("trigger_product_name"),
+                rs.getString("message"),
+                rs.getInt("priority"),
+                rs.getBoolean("is_active"),
+                rs.getObject("starts_at", OffsetDateTime.class),
+                rs.getObject("ends_at", OffsetDateTime.class),
+                rs.getObject("created_at", OffsetDateTime.class),
+                rs.getObject("updated_at", OffsetDateTime.class)
+        );
+    }
+
+    private Membership requireRecommendationWriteAccess(Long cafeteriaId, Long locationId) {
+        return locationId == null
+                ? requireTenantAccess(cafeteriaId, true)
+                : requireLocationAccess(cafeteriaId, locationId, true);
+    }
+
+    private void validateCheckoutRecommendation(Long cafeteriaId, CheckoutRecommendationRequest request) {
+        ensureProduct(cafeteriaId, request.productId());
+        if (request.locationId() != null) {
+            ensureLocation(cafeteriaId, request.locationId());
+        }
+        if (request.triggerProductId() != null) {
+            ensureProduct(cafeteriaId, request.triggerProductId());
+            if (request.triggerProductId().equals(request.productId())) {
+                throw new BadRequestException("A product cannot recommend itself");
+            }
+        }
+        if (request.startsAt() != null
+                && request.endsAt() != null
+                && !request.startsAt().isBefore(request.endsAt())) {
+            throw new BadRequestException("startsAt must be before endsAt");
+        }
+    }
+
+    private String normalizeRecommendationMessage(String message) {
+        if (message == null) {
+            return null;
+        }
+        String normalized = message.trim();
+        return normalized.isEmpty() ? null : normalized;
     }
 
     private List<Map<String, Object>> productImages(Long cafeteriaId, Long productId) {

@@ -4,8 +4,11 @@ import com.kaffe.common.web.ApiResponse;
 import com.kaffe.common.media.MediaCompleteRequest;
 import com.kaffe.common.media.MediaUploadRequest;
 import com.kaffe.common.media.PresignedMediaUpload;
+import com.kaffe.menuadmin.dto.CheckoutRecommendationRequest;
+import com.kaffe.menuadmin.dto.CheckoutRecommendationResponse;
 import com.kaffe.menuadmin.service.MenuAdminService;
 import com.kaffe.menuadmin.dto.MenuCatalogResponse;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -34,6 +37,60 @@ public class MenuAdminController {
             @RequestParam(required = false) Long locationId
     ) {
         return ApiResponse.ok("Menu catalog found", menuAdminService.getCatalog(cafeteriaId, locationId));
+    }
+
+    @GetMapping("/checkout-recommendations")
+    public ApiResponse<List<CheckoutRecommendationResponse>> listCheckoutRecommendations(
+            @PathVariable Long cafeteriaId,
+            @RequestParam(required = false) Long locationId
+    ) {
+        return ApiResponse.ok(
+                "Checkout recommendations found",
+                menuAdminService.listCheckoutRecommendations(cafeteriaId, locationId)
+        );
+    }
+
+    @PostMapping("/checkout-recommendations")
+    public ApiResponse<CheckoutRecommendationResponse> createCheckoutRecommendation(
+            @PathVariable Long cafeteriaId,
+            @Valid @RequestBody CheckoutRecommendationRequest request
+    ) {
+        return ApiResponse.ok(
+                "Checkout recommendation created successfully",
+                menuAdminService.createCheckoutRecommendation(cafeteriaId, request)
+        );
+    }
+
+    @GetMapping("/checkout-recommendations/{recommendationId}")
+    public ApiResponse<CheckoutRecommendationResponse> getCheckoutRecommendation(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long recommendationId
+    ) {
+        return ApiResponse.ok(
+                "Checkout recommendation found",
+                menuAdminService.getCheckoutRecommendation(cafeteriaId, recommendationId)
+        );
+    }
+
+    @PutMapping("/checkout-recommendations/{recommendationId}")
+    public ApiResponse<CheckoutRecommendationResponse> updateCheckoutRecommendation(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long recommendationId,
+            @Valid @RequestBody CheckoutRecommendationRequest request
+    ) {
+        return ApiResponse.ok(
+                "Checkout recommendation updated successfully",
+                menuAdminService.updateCheckoutRecommendation(cafeteriaId, recommendationId, request)
+        );
+    }
+
+    @DeleteMapping("/checkout-recommendations/{recommendationId}")
+    public ApiResponse<Void> deleteCheckoutRecommendation(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long recommendationId
+    ) {
+        menuAdminService.softDeleteCheckoutRecommendation(cafeteriaId, recommendationId);
+        return ApiResponse.ok("Checkout recommendation deleted successfully", null);
     }
 
     @GetMapping("/settings/menu")
