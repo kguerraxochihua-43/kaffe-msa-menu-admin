@@ -331,6 +331,29 @@ public class MenuAdminController {
         return ApiResponse.ok("Product updated successfully", menuAdminService.updateProduct(cafeteriaId, productId, request));
     }
 
+    @GetMapping("/products/{productId}/components")
+    public ApiResponse<List<Map<String, Object>>> listProductComponents(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId
+    ) {
+        return ApiResponse.ok(
+                "Product components found",
+                menuAdminService.listProductComponents(cafeteriaId, productId)
+        );
+    }
+
+    @PutMapping("/products/{productId}/components")
+    public ApiResponse<List<Map<String, Object>>> replaceProductComponents(
+            @PathVariable Long cafeteriaId,
+            @PathVariable Long productId,
+            @RequestBody Map<String, Object> request
+    ) {
+        return ApiResponse.ok(
+                "Product components updated successfully",
+                menuAdminService.replaceProductComponents(cafeteriaId, productId, request)
+        );
+    }
+
     @PostMapping("/products/{productId}/image-upload-request")
     public ApiResponse<PresignedMediaUpload> createProductImageUploadRequest(
             @PathVariable Long cafeteriaId,

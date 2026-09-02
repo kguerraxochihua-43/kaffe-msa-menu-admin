@@ -59,11 +59,17 @@ public class MenuAdminService {
         }
 
         List<Map<String, Object>> categories = jdbcTemplate.query("""
-                        select *
-                        from menu.categories
-                        where tenant_id = ?
-                          and deleted_at is null
-                        order by sort_order asc, name asc
+                        select category.*, parent.name as parent_category_name
+                        from menu.categories category
+                        left join menu.categories parent
+                          on parent.category_id = category.parent_category_id
+                         and parent.tenant_id = category.tenant_id
+                         and parent.deleted_at is null
+                        where category.tenant_id = ?
+                          and category.deleted_at is null
+                        order by parent.sort_order nulls first,
+                                 category.parent_category_id nulls first,
+                                 category.sort_order asc, category.name asc
                         """,
                 (rs, rowNum) -> categoryRow(rs),
                 cafeteriaId);
@@ -747,11 +753,17 @@ public class MenuAdminService {
     public List<Map<String, Object>> listCategories(Long cafeteriaId) {
         requireTenantAccess(cafeteriaId, false);
         return jdbcTemplate.query("""
-                        select *
-                        from menu.categories
-                        where tenant_id = ?
-                          and deleted_at is null
-                        order by sort_order asc, name asc
+                        select category.*, parent.name as parent_category_name
+                        from menu.categories category
+                        left join menu.categories parent
+                          on parent.category_id = category.parent_category_id
+                         and parent.tenant_id = category.tenant_id
+                         and parent.deleted_at is null
+                        where category.tenant_id = ?
+                          and category.deleted_at is null
+                        order by parent.sort_order nulls first,
+                                 category.parent_category_id nulls first,
+                                 category.sort_order asc, category.name asc
                         """,
                 (rs, rowNum) -> categoryRow(rs),
                 cafeteriaId);
@@ -766,13 +778,18 @@ public class MenuAdminService {
     public Map<String, Object> createCategory(Long cafeteriaId, Map<String, Object> request) {
         MenuAdminRules.validateCategory(request, true);
         requireTenantAccess(cafeteriaId, true);
+        Long parentCategoryId = nullableLong(request.get("parentCategoryId"));
+        validateCategoryParent(cafeteriaId, null, parentCategoryId);
         Long categoryId = jdbcTemplate.queryForObject("""
-                        insert into menu.categories (tenant_id, name, description, sort_order, is_active)
-                        values (?, ?, ?, ?, ?)
+                        insert into menu.categories (
+                            tenant_id, parent_category_id, name, description, sort_order, is_active
+                        )
+                        values (?, ?, ?, ?, ?, ?)
                         returning category_id
                         """,
                 Long.class,
                 cafeteriaId,
+                parentCategoryId,
                 requiredString(request, "name"),
                 stringOrNull(request.get("description")),
                 intValue(request.getOrDefault("sortOrder", 0)),
@@ -791,9 +808,13 @@ public class MenuAdminService {
         MenuAdminRules.validateCategory(request, false);
         requireTenantAccess(cafeteriaId, true);
         ensureCategory(cafeteriaId, categoryId);
+        boolean parentProvided = request.containsKey("parentCategoryId");
+        Long parentCategoryId = nullableLong(request.get("parentCategoryId"));
+        if (parentProvided) validateCategoryParent(cafeteriaId, categoryId, parentCategoryId);
         jdbcTemplate.update("""
                         update menu.categories
-                        set name = coalesce(?, name),
+                        set parent_category_id = case when ? then ? else parent_category_id end,
+                            name = coalesce(?, name),
                             description = coalesce(?, description),
                             sort_order = coalesce(?, sort_order),
                             is_active = coalesce(?, is_active),
@@ -802,6 +823,8 @@ public class MenuAdminService {
                           and category_id = ?
                           and deleted_at is null
                         """,
+                parentProvided,
+                parentCategoryId,
                 stringOrNull(request.get("name")),
                 stringOrNull(request.get("description")),
                 nullableInt(request.get("sortOrder")),
@@ -818,6 +841,13 @@ public class MenuAdminService {
     public void softDeleteCategory(Long cafeteriaId, Long categoryId) {
         Long userId = requireTenantAccess(cafeteriaId, true).userId();
         ensureCategory(cafeteriaId, categoryId);
+        Boolean hasChildren = jdbcTemplate.queryForObject("""
+                select exists(select 1 from menu.categories
+                    where tenant_id = ? and parent_category_id = ? and deleted_at is null)
+                """, Boolean.class, cafeteriaId, categoryId);
+        if (Boolean.TRUE.equals(hasChildren)) {
+            throw new ConflictException("Move or delete the subcategories before deleting this category");
+        }
         jdbcTemplate.update("""
                         update menu.categories
                         set is_active = false,
@@ -1058,6 +1088,9 @@ public class MenuAdminService {
         if (request.containsKey("addonGroupIds")) {
             replaceProductAddonGroups(cafeteriaId, productId, longList(request.get("addonGroupIds")));
         }
+        if (request.containsKey("components")) {
+            replaceProductComponents(cafeteriaId, productId, request);
+        }
         if (request.containsKey("locationIds")) {
             updateProductLocations(cafeteriaId, productId, request);
         }
@@ -1101,10 +1134,98 @@ public class MenuAdminService {
         if (request.containsKey("addonGroupIds")) {
             replaceProductAddonGroups(cafeteriaId, productId, longList(request.get("addonGroupIds")));
         }
+        if (request.containsKey("components")) {
+            replaceProductComponents(cafeteriaId, productId, request);
+        }
         if (request.containsKey("locationIds") || request.containsKey("global")) {
             updateProductLocations(cafeteriaId, productId, request);
         }
         return getProduct(cafeteriaId, productId);
+    }
+
+    public List<Map<String, Object>> listProductComponents(Long cafeteriaId, Long productId) {
+        requireTenantAccess(cafeteriaId, false);
+        ensureProduct(cafeteriaId, productId);
+        return jdbcTemplate.queryForList("""
+                select component.product_component_id, component.product_id,
+                       component.component_product_id, product.name as component_name,
+                       product.base_price as component_base_price,
+                       component.quantity, component.sort_order,
+                       component.is_optional, component.version
+                from menu.product_components component
+                join menu.products product
+                  on product.product_id = component.component_product_id
+                 and product.tenant_id = component.tenant_id
+                where component.tenant_id = ? and component.product_id = ?
+                  and product.deleted_at is null
+                order by component.sort_order, product.name
+                """, cafeteriaId, productId);
+    }
+
+    @Transactional
+    public List<Map<String, Object>> replaceProductComponents(
+            Long cafeteriaId,
+            Long productId,
+            Map<String, Object> request
+    ) {
+        requireTenantAccess(cafeteriaId, true);
+        ensureProduct(cafeteriaId, productId);
+        Object raw = request.get("components");
+        if (!(raw instanceof List<?> values)) {
+            throw new BadRequestException("components must be a list");
+        }
+        if (values.size() > 50) {
+            throw new BadRequestException("A product can contain at most 50 components");
+        }
+        List<ProductComponentInput> components = new ArrayList<>();
+        Set<Long> seen = new HashSet<>();
+        for (int index = 0; index < values.size(); index++) {
+            if (!(values.get(index) instanceof Map<?, ?> value)) {
+                throw new BadRequestException("Each component must be an object");
+            }
+            Long componentProductId = nullableLong(value.get("productId"));
+            if (componentProductId == null) {
+                componentProductId = nullableLong(value.get("componentProductId"));
+            }
+            if (componentProductId == null) {
+                throw new BadRequestException("component productId is required");
+            }
+            if (componentProductId.equals(productId)) {
+                throw new BadRequestException("A product cannot contain itself");
+            }
+            if (!seen.add(componentProductId)) {
+                throw new BadRequestException("Duplicate product components are not allowed");
+            }
+            ensureProduct(cafeteriaId, componentProductId);
+            BigDecimal quantity = nullableBigDecimal(value.get("quantity"));
+            if (quantity == null) quantity = BigDecimal.ONE;
+            if (quantity.signum() <= 0 || quantity.compareTo(new BigDecimal("9999")) > 0) {
+                throw new BadRequestException("Component quantity must be greater than zero");
+            }
+            validateProductComponentCycle(cafeteriaId, productId, componentProductId);
+            Integer requestedOrder = nullableInt(value.get("sortOrder"));
+            components.add(new ProductComponentInput(
+                    componentProductId,
+                    quantity,
+                    requestedOrder == null ? index : requestedOrder,
+                    Boolean.TRUE.equals(nullableBoolean(value.get("optional")))
+            ));
+        }
+        jdbcTemplate.update(
+                "delete from menu.product_components where tenant_id = ? and product_id = ?",
+                cafeteriaId,
+                productId
+        );
+        for (ProductComponentInput component : components) {
+            jdbcTemplate.update("""
+                    insert into menu.product_components (
+                        tenant_id, product_id, component_product_id,
+                        quantity, sort_order, is_optional
+                    ) values (?, ?, ?, ?, ?, ?)
+                    """, cafeteriaId, productId, component.productId(), component.quantity(),
+                    component.sortOrder(), component.optional());
+        }
+        return listProductComponents(cafeteriaId, productId);
     }
 
     @Transactional
@@ -2129,6 +2250,60 @@ public class MenuAdminService {
         ensureExists("select exists(select 1 from menu.categories where category_id = ? and tenant_id = ? and deleted_at is null)", categoryId, cafeteriaId, "Category was not found for this cafeteria");
     }
 
+    private void validateCategoryParent(Long cafeteriaId, Long categoryId, Long parentCategoryId) {
+        if (parentCategoryId == null) return;
+        if (parentCategoryId.equals(categoryId)) {
+            throw new BadRequestException("A category cannot contain itself");
+        }
+        ensureCategory(cafeteriaId, parentCategoryId);
+        if (categoryId == null) return;
+        Boolean cycle = jdbcTemplate.queryForObject("""
+                with recursive descendants(category_id, path) as (
+                    select category_id, array[category_id]::bigint[]
+                    from menu.categories
+                    where tenant_id = ? and parent_category_id = ? and deleted_at is null
+                    union all
+                    select child.category_id, descendants.path || child.category_id
+                    from descendants
+                    join menu.categories child
+                      on child.parent_category_id = descendants.category_id
+                     and child.tenant_id = ?
+                     and child.deleted_at is null
+                    where not child.category_id = any(descendants.path)
+                )
+                select exists(select 1 from descendants where category_id = ?)
+                """, Boolean.class, cafeteriaId, categoryId, cafeteriaId, parentCategoryId);
+        if (Boolean.TRUE.equals(cycle)) {
+            throw new BadRequestException("This parent would create a category cycle");
+        }
+    }
+
+    private void validateProductComponentCycle(
+            Long cafeteriaId, Long productId, Long componentProductId
+    ) {
+        Boolean cycle = jdbcTemplate.queryForObject("""
+                with recursive descendants(product_id, path) as (
+                    select component_product_id,
+                           array[product_id, component_product_id]::bigint[]
+                    from menu.product_components
+                    where tenant_id = ? and product_id = ?
+                    union all
+                    select child.component_product_id,
+                           descendants.path || child.component_product_id
+                    from descendants
+                    join menu.product_components child
+                      on child.product_id = descendants.product_id
+                     and child.tenant_id = ?
+                    where not child.component_product_id = any(descendants.path)
+                      and cardinality(descendants.path) < 12
+                )
+                select exists(select 1 from descendants where product_id = ?)
+                """, Boolean.class, cafeteriaId, componentProductId, cafeteriaId, productId);
+        if (Boolean.TRUE.equals(cycle)) {
+            throw new BadRequestException("This component would create a product bundle cycle");
+        }
+    }
+
     private void ensureProduct(Long cafeteriaId, Long productId) {
         ensureExists("select exists(select 1 from menu.products where product_id = ? and tenant_id = ? and deleted_at is null)", productId, cafeteriaId, "Product was not found for this cafeteria");
     }
@@ -2218,11 +2393,15 @@ public class MenuAdminService {
 
     private Map<String, Object> findCategory(Long cafeteriaId, Long categoryId) {
         return queryOne("""
-                        select *
-                        from menu.categories
-                        where tenant_id = ?
-                          and category_id = ?
-                          and deleted_at is null
+                        select category.*, parent.name as parent_category_name
+                        from menu.categories category
+                        left join menu.categories parent
+                          on parent.category_id = category.parent_category_id
+                         and parent.tenant_id = category.tenant_id
+                         and parent.deleted_at is null
+                        where category.tenant_id = ?
+                          and category.category_id = ?
+                          and category.deleted_at is null
                         """,
                 rs -> categoryRow(rs),
                 cafeteriaId,
@@ -3019,6 +3198,8 @@ public class MenuAdminService {
         return row(
                 "categoryId", rs.getLong("category_id"),
                 "cafeteriaId", rs.getLong("tenant_id"),
+                "parentCategoryId", nullableColumnLong(rs, "parent_category_id"),
+                "parentCategoryName", nullableColumnString(rs, "parent_category_name"),
                 "name", rs.getString("name"),
                 "description", rs.getString("description"),
                 "sortOrder", rs.getInt("sort_order"),
@@ -3673,6 +3854,14 @@ public class MenuAdminService {
     }
 
     private record Membership(Long userId, Long tenantId, String roleCode) {
+    }
+
+    private record ProductComponentInput(
+            Long productId,
+            BigDecimal quantity,
+            int sortOrder,
+            boolean optional
+    ) {
     }
 
     private String authSql(String sql) {
