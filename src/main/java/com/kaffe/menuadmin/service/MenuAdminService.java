@@ -45,6 +45,7 @@ public class MenuAdminService {
     private final JdbcTemplate jdbcTemplate;
     private final CurrentUserProvider currentUserProvider;
     private final MediaAssetService mediaAssetService;
+    private final ProductImageDerivativeService productImageDerivativeService;
 
     @org.springframework.beans.factory.annotation.Value("${kaffe.auth.schema:kaffe_auth}")
     private String authSchema = "auth";
@@ -944,6 +945,8 @@ public class MenuAdminService {
         ensureProductImageAsset(productId, pending);
         MediaAsset asset = mediaAssetService.completeUpload(assetId, cafeteriaId, membership.userId(), request);
         ensureProductImageAsset(productId, asset);
+        productImageDerivativeService.prepareForDelivery(asset);
+        asset = mediaAssetService.findAsset(assetId, cafeteriaId);
         return attachProductImage(cafeteriaId, productId, asset);
     }
 
