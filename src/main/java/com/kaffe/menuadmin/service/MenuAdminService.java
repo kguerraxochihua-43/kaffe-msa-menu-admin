@@ -50,6 +50,10 @@ public class MenuAdminService {
     @org.springframework.beans.factory.annotation.Value("${kaffe.auth.schema:kaffe_auth}")
     private String authSchema = "auth";
 
+    public Long requireGlobalMenuWriteAccess(Long cafeteriaId) {
+        return requireTenantAccess(cafeteriaId, true).userId();
+    }
+
     @Transactional(readOnly = true)
     public MenuCatalogResponse getCatalog(Long cafeteriaId, Long locationId) {
         if (locationId == null) {
