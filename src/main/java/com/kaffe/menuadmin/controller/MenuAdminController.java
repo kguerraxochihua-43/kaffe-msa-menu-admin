@@ -31,6 +31,13 @@ public class MenuAdminController {
 
     private final MenuAdminService menuAdminService;
 
+    @PutMapping("/locations/{locationId}/preparation-routing/{kind}/{entityId}")
+    public ApiResponse<Void> updatePreparationRoute(@PathVariable Long cafeteriaId, @PathVariable Long locationId,
+            @PathVariable String kind, @PathVariable Long entityId, @RequestBody Map<String,Object> request) {
+        menuAdminService.updatePreparationRoute(cafeteriaId,locationId,kind,entityId,request);
+        return ApiResponse.ok("Estación actualizada",null);
+    }
+
     @GetMapping("/catalog")
     public ApiResponse<MenuCatalogResponse> getCatalog(
             @PathVariable Long cafeteriaId,

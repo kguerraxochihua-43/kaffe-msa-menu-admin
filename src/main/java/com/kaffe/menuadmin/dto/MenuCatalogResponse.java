@@ -11,6 +11,8 @@ public record MenuCatalogResponse(
         List<Map<String, Object>> products,
         List<Map<String, Object>> addonGroups,
         List<Map<String, Object>> addons,
-        List<Map<String, Object>> productAddonGroups
+        List<Map<String, Object>> productAddonGroups,
+        List<Map<String, Object>> preparationStations,
+        List<Map<String, Object>> preparationRoutes
 ) {
 }

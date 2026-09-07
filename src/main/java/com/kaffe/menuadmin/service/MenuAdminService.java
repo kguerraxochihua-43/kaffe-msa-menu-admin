@@ -174,7 +174,9 @@ public class MenuAdminService {
                 products,
                 addonGroups,
                 addons,
-                productAddonGroups
+                productAddonGroups,
+                preparationStations(cafeteriaId, locationId),
+                preparationRoutes(cafeteriaId, locationId)
         );
     }
 
@@ -804,6 +806,7 @@ public class MenuAdminService {
         } else {
             ensureDefaultPublicationForCategory(cafeteriaId, categoryId);
         }
+        savePreparationRoutes(cafeteriaId, categoryId, false, request);
         return findCategory(cafeteriaId, categoryId);
     }
 
@@ -812,6 +815,7 @@ public class MenuAdminService {
         MenuAdminRules.validateCategory(request, false);
         requireTenantAccess(cafeteriaId, true);
         ensureCategory(cafeteriaId, categoryId);
+        savePreparationRoutes(cafeteriaId, categoryId, false, request);
         boolean parentProvided = request.containsKey("parentCategoryId");
         Long parentCategoryId = nullableLong(request.get("parentCategoryId"));
         if (parentProvided) validateCategoryParent(cafeteriaId, categoryId, parentCategoryId);
@@ -1098,6 +1102,7 @@ public class MenuAdminService {
         if (request.containsKey("locationIds")) {
             updateProductLocations(cafeteriaId, productId, request);
         }
+        savePreparationRoutes(cafeteriaId, productId, true, request);
         return getProduct(cafeteriaId, productId);
     }
 
@@ -1106,6 +1111,7 @@ public class MenuAdminService {
         MenuAdminRules.validateProduct(request, false);
         requireTenantAccess(cafeteriaId, true);
         ensureProduct(cafeteriaId, productId);
+        savePreparationRoutes(cafeteriaId, productId, true, request);
         Long categoryId = nullableLong(request.get("categoryId"));
         if (categoryId != null) {
             ensureCategory(cafeteriaId, categoryId);
@@ -1635,6 +1641,7 @@ public class MenuAdminService {
         requireLocationAccess(cafeteriaId, locationId, true);
         ensureLocation(cafeteriaId, locationId);
         ensureProduct(cafeteriaId, productId);
+        savePreparationRoutes(cafeteriaId, productId, true, request);
         Long locationProductId = jdbcTemplate.queryForObject("""
                         insert into menu.location_products (
                             location_id, tenant_id, product_id, price_override,
@@ -2092,6 +2099,88 @@ public class MenuAdminService {
                 cafeteriaId,
                 menuId,
                 categoryId);
+    }
+
+    private List<Map<String,Object>> preparationStations(Long tenant, Long location) {
+        return jdbcTemplate.queryForList(authSql("""
+                select s.station_id as "stationId", s.location_id as "locationId", l.name as "locationName",
+                    s.name, s.status_code as "status", s.kds_enabled as "kdsEnabled"
+                from workforce.operational_stations s join core.locations l on l.location_id=s.location_id and l.tenant_id=s.tenant_id
+                where s.tenant_id=? and (?::bigint is null or s.location_id=?) and exists(
+                    select 1 from auth.tenant_user_role_assignments a
+                    join auth.tenant_roles r on r.tenant_role_id=a.tenant_role_id and r.tenant_id=a.tenant_id and r.status_id=1
+                    join auth.tenant_role_policies rp on rp.tenant_role_id=r.tenant_role_id and rp.enabled
+                    join catalog.lkp_policies p on p.policy_id=rp.policy_id and p.status_id=1
+                    where a.user_id=? and a.tenant_id=s.tenant_id and a.status_id=1
+                        and (a.location_id is null or a.location_id=s.location_id) and p.code in ('menu:read','menu:write'))
+                order by l.name,s.sort_order,s.name
+                """),tenant,location,location,currentUserProvider.requireUserId());
+    }
+
+    private List<Map<String,Object>> preparationRoutes(Long tenant, Long location) {
+        Set<Long> allowed = preparationStations(tenant,location).stream().map(r -> ((Number)r.get("locationId")).longValue()).collect(java.util.stream.Collectors.toSet());
+        if(allowed.isEmpty()) return List.of();
+        List<Object> args = new ArrayList<>();
+        args.add(tenant);
+        args.addAll(allowed);
+        return jdbcTemplate.queryForList("""
+                select route_id as "routeId", location_id as "locationId", product_id as "productId", category_id as "categoryId",
+                    station_id as "stationId", active, version from menu.preparation_routes where tenant_id=? and location_id in (%s)
+                """.formatted(String.join(",", java.util.Collections.nCopies(allowed.size(), "?"))), args.toArray());
+    }
+
+    @Transactional
+    public void updatePreparationRoute(Long tenant, Long location, String kind, Long entityId, Map<String,Object> request) {
+        if(!Set.of("products","categories").contains(kind)) throw new BadRequestException("Selecciona un producto o categoría.");
+        requireLocationAccess(tenant,location,true);
+        if(kind.equals("products")) ensureProduct(tenant,entityId); else ensureCategory(tenant,entityId);
+        Map<String,Object> route=new LinkedHashMap<>(request);
+        route.put("locationId",location);
+        savePreparationRoutes(tenant,entityId,kind.equals("products"),Map.of("preparationRoutes",List.of(route)));
+    }
+
+    private void savePreparationRoutes(Long tenant, Long entity, boolean product, Map<String,Object> body) {
+        if(!body.containsKey("preparationRoutes")) return;
+        if(!(body.get("preparationRoutes") instanceof List<?> routes) || routes.size()>200) throw new BadRequestException("Revisa las estaciones por sucursal.");
+        // A transaction lock on this catalog entity also serializes first route
+        // creation. It never needs UPDATE privileges on the core location table.
+        jdbcTemplate.queryForList("select pg_advisory_xact_lock(hashtextextended(?, 0))",
+                "preparation-route:" + tenant + ":" + product + ":" + entity);
+        Set<Long> seen=new HashSet<>();
+        for(Object entry:routes) {
+            if(!(entry instanceof Map<?,?> route) || !route.containsKey("stationId")) throw new BadRequestException("Actualiza las estaciones antes de guardar.");
+            long location=preparationRouteNumber(route.get("locationId"), false);
+            long expectedVersion=preparationRouteNumber(route.get("expectedVersion"), true);
+            if(!seen.add(location)) throw new BadRequestException("La sucursal está repetida.");
+            long actor=requireLocationAccess(tenant,location,true).userId();
+            Long station=route.get("stationId")==null?null:preparationRouteNumber(route.get("stationId"), false);
+            String column=product?"product_id":"category_id";
+            List<Map<String,Object>> existing=jdbcTemplate.queryForList("select * from menu.preparation_routes where tenant_id=? and location_id=? and "+column+"=? for update",tenant,location,entity);
+            int version=existing.isEmpty()?0:((Number)existing.getFirst().get("version")).intValue();
+            if(expectedVersion!=version) throw new ConflictException("La estación cambió. Actualiza antes de guardar.");
+            if(station!=null && !Boolean.TRUE.equals(jdbcTemplate.queryForObject("select exists(select 1 from workforce.operational_stations where tenant_id=? and location_id=? and station_id=? and status_code='active' and kds_enabled)",Boolean.class,tenant,location,station))) throw new BadRequestException("Selecciona una estación activa de esta sucursal.");
+            if(station==null && existing.isEmpty()) continue;
+            if(existing.isEmpty()) {
+                jdbcTemplate.update("insert into menu.preparation_routes(tenant_id,location_id,"+column+",station_id,updated_by_user_id,version) values(?,?,?,?,?,1)",tenant,location,entity,station,actor);
+            } else {
+                jdbcTemplate.update("update menu.preparation_routes set station_id=coalesce(?,station_id),active=?,version=version+1,updated_by_user_id=?,updated_at=now() where route_id=?",station,station!=null,actor,existing.getFirst().get("route_id"));
+            }
+            jdbcTemplate.update("""
+                    insert into orders.preparation_audit_events(tenant_id,location_id,actor_user_id,action_code,entity_id,before_value,after_value)
+                    values(?,?,?,?,?,jsonb_build_object('stationId',?::bigint),jsonb_build_object('stationId',?::bigint,'inherited',?))
+                    """,tenant,location,actor,product?"product_route_changed":"category_route_changed",entity,
+                    existing.isEmpty()?null:existing.getFirst().get("station_id"),station,station==null);
+        }
+    }
+
+    static long preparationRouteNumber(Object value, boolean allowZero) {
+        if (value instanceof Number number) {
+            try {
+                long result = new java.math.BigDecimal(number.toString()).longValueExact();
+                if (result >= (allowZero ? 0 : 1)) return result;
+            } catch (ArithmeticException | NumberFormatException ignored) { }
+        }
+        throw new BadRequestException("Revisa la estación y actualiza la configuración antes de guardar.");
     }
 
     private Membership requireTenantAccess(Long cafeteriaId, boolean managerRequired) {
