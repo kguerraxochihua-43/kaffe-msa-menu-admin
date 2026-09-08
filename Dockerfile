@@ -1,12 +1,10 @@
-FROM eclipse-temurin:21-jre-alpine
-
-RUN addgroup -S kaffe && adduser -S kaffe -G kaffe
+FROM gcr.io/distroless/java21-debian12:nonroot@sha256:7e37784d94dccbf5ccb195c73b295f5ad00cd266512dfbac12eb9c3c28f8077d
 
 WORKDIR /app
 ARG JAR_FILE=target/kaffe-msa-menu-admin.jar
-COPY ${JAR_FILE} app.jar
+COPY --chown=65532:65532 ${JAR_FILE} app.jar
 
-USER kaffe
+USER 65532:65532
 
 EXPOSE 8086
 

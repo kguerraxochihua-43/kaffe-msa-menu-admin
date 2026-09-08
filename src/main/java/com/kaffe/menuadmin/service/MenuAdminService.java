@@ -783,7 +783,10 @@ public class MenuAdminService {
     @Transactional
     public Map<String, Object> createCategory(Long cafeteriaId, Map<String, Object> request) {
         MenuAdminRules.validateCategory(request, true);
-        requireTenantAccess(cafeteriaId, true);
+        var actor = requireTenantAccess(cafeteriaId, true).userId();
+        var retries = new CatalogCreationRequests(jdbcTemplate);
+        var claim = retries.begin(cafeteriaId, actor, "category", null, request);
+        if (claim.resourceId() != null) return findCategory(cafeteriaId, claim.resourceId());
         Long parentCategoryId = nullableLong(request.get("parentCategoryId"));
         validateCategoryParent(cafeteriaId, null, parentCategoryId);
         Long categoryId = jdbcTemplate.queryForObject("""
@@ -807,6 +810,7 @@ public class MenuAdminService {
             ensureDefaultPublicationForCategory(cafeteriaId, categoryId);
         }
         savePreparationRoutes(cafeteriaId, categoryId, false, request);
+        retries.complete(cafeteriaId, actor, claim, categoryId);
         return findCategory(cafeteriaId, categoryId);
     }
 
@@ -823,7 +827,7 @@ public class MenuAdminService {
                         update menu.categories
                         set parent_category_id = case when ? then ? else parent_category_id end,
                             name = coalesce(?, name),
-                            description = coalesce(?, description),
+                            description = case when ? then ? else description end,
                             sort_order = coalesce(?, sort_order),
                             is_active = coalesce(?, is_active),
                             updated_at = now()
@@ -834,6 +838,7 @@ public class MenuAdminService {
                 parentProvided,
                 parentCategoryId,
                 stringOrNull(request.get("name")),
+                request.containsKey("description"),
                 stringOrNull(request.get("description")),
                 nullableInt(request.get("sortOrder")),
                 nullableBoolean(request.get("active")),
@@ -1069,7 +1074,10 @@ public class MenuAdminService {
     @Transactional
     public Map<String, Object> createProduct(Long cafeteriaId, Map<String, Object> request) {
         MenuAdminRules.validateProduct(request, true);
-        requireTenantAccess(cafeteriaId, true);
+        Long actorId = requireTenantAccess(cafeteriaId, true).userId();
+        var requests = new ProductCreationRequests(jdbcTemplate);
+        var claim = requests.begin(cafeteriaId, actorId, request);
+        if (claim.productId() != null) return getProduct(cafeteriaId, claim.productId());
         Long categoryId = nullableLong(request.get("categoryId"));
         if (categoryId != null) {
             ensureCategory(cafeteriaId, categoryId);
@@ -1103,6 +1111,7 @@ public class MenuAdminService {
             updateProductLocations(cafeteriaId, productId, request);
         }
         savePreparationRoutes(cafeteriaId, productId, true, request);
+        requests.complete(cafeteriaId, actorId, claim, productId);
         return getProduct(cafeteriaId, productId);
     }
 
@@ -1120,7 +1129,7 @@ public class MenuAdminService {
                         update menu.products
                         set category_id = coalesce(?, category_id),
                             name = coalesce(?, name),
-                            description = coalesce(?, description),
+                            description = case when ? then ? else description end,
                             base_price = coalesce(?, base_price),
                             image_url = coalesce(?, image_url),
                             is_featured = coalesce(?, is_featured),
@@ -1133,6 +1142,7 @@ public class MenuAdminService {
                         """,
                 categoryId,
                 stringOrNull(request.get("name")),
+                request.containsKey("description"),
                 stringOrNull(request.get("description")),
                 nullableInt(request.get("basePrice")),
                 stringOrNull(request.get("imageUrl")),
@@ -1345,7 +1355,10 @@ public class MenuAdminService {
     @Transactional
     public Map<String, Object> createAddonGroup(Long cafeteriaId, Map<String, Object> request) {
         MenuAdminRules.validateAddonGroup(request, true);
-        requireTenantAccess(cafeteriaId, true);
+        var actor = requireTenantAccess(cafeteriaId, true).userId();
+        var retries = new CatalogCreationRequests(jdbcTemplate);
+        var claim = retries.begin(cafeteriaId, actor, "addon_group", null, request);
+        if (claim.resourceId() != null) return getAddonGroup(cafeteriaId, claim.resourceId());
         Boolean required = booleanValue(request.getOrDefault("required", false));
         Integer minSelection = intValue(request.getOrDefault("minSelection", 0));
         Integer maxSelection = nullableInt(request.get("maxSelection"));
@@ -1367,6 +1380,7 @@ public class MenuAdminService {
                 required,
                 intValue(request.getOrDefault("sortOrder", 0)),
                 booleanValue(request.getOrDefault("active", true)));
+        retries.complete(cafeteriaId, actor, claim, addonGroupId);
         return getAddonGroup(cafeteriaId, addonGroupId);
     }
 
@@ -1381,14 +1395,14 @@ public class MenuAdminService {
         validateSelection(
                 required == null ? (Boolean) current.get("required") : required,
                 minSelection == null ? (Integer) current.get("minSelection") : minSelection,
-                maxSelection == null ? (Integer) current.get("maxSelection") : maxSelection
+                request.containsKey("maxSelection") ? maxSelection : (Integer) current.get("maxSelection")
         );
         jdbcTemplate.update("""
                         update menu.lkp_addon_groups
                         set name = coalesce(?, name),
-                            description = coalesce(?, description),
+                            description = case when ? then ? else description end,
                             min_selection = coalesce(?, min_selection),
-                            max_selection = coalesce(?, max_selection),
+                            max_selection = case when ? then cast(? as integer) else max_selection end,
                             is_required = coalesce(?, is_required),
                             sort_order = coalesce(?, sort_order),
                             is_active = coalesce(?, is_active),
@@ -1398,8 +1412,10 @@ public class MenuAdminService {
                           and deleted_at is null
                         """,
                 stringOrNull(request.get("name")),
+                request.containsKey("description"),
                 stringOrNull(request.get("description")),
                 nullableInt(request.get("minSelection")),
+                request.containsKey("maxSelection"),
                 nullableInt(request.get("maxSelection")),
                 nullableBoolean(request.get("required")),
                 nullableInt(request.get("sortOrder")),
@@ -1501,7 +1517,10 @@ public class MenuAdminService {
     @Transactional
     public Map<String, Object> createAddon(Long cafeteriaId, Long addonGroupId, Map<String, Object> request) {
         MenuAdminRules.validateAddon(request, true);
-        requireTenantAccess(cafeteriaId, true);
+        var actor = requireTenantAccess(cafeteriaId, true).userId();
+        var retries = new CatalogCreationRequests(jdbcTemplate);
+        var claim = retries.begin(cafeteriaId, actor, "addon", addonGroupId, request);
+        if (claim.resourceId() != null) return findAddon(cafeteriaId, claim.resourceId());
         ensureAddonGroup(cafeteriaId, addonGroupId);
         boolean isDefault = booleanValue(request.getOrDefault("isDefault", request.getOrDefault("default", false)));
         if (isDefault) {
@@ -1523,6 +1542,7 @@ public class MenuAdminService {
                 intValue(request.getOrDefault("sortOrder", 0)),
                 booleanValue(request.getOrDefault("active", true)),
                 isDefault);
+        retries.complete(cafeteriaId, actor, claim, addonId);
         return findAddon(cafeteriaId, addonId);
     }
 
@@ -1538,7 +1558,7 @@ public class MenuAdminService {
         jdbcTemplate.update("""
                         update menu.lkp_addons
                         set name = coalesce(?, name),
-                            description = coalesce(?, description),
+                            description = case when ? then ? else description end,
                             price = coalesce(?, price),
                             sort_order = coalesce(?, sort_order),
                             is_active = coalesce(?, is_active),
@@ -1550,6 +1570,7 @@ public class MenuAdminService {
                           and deleted_at is null
                         """,
                 stringOrNull(request.get("name")),
+                request.containsKey("description"),
                 stringOrNull(request.get("description")),
                 nullableInt(request.get("price")),
                 nullableInt(request.get("sortOrder")),

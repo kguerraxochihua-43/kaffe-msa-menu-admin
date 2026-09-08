@@ -2,28 +2,33 @@ name: Build
 
 on:
   push:
-    branches:
-      - dev
-      - prod
+    branches: [dev, prod]
   pull_request:
-    branches:
-      - dev
-      - prod
+    branches: [dev, prod]
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  product-postgres:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: read
-      id-token: write
-
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: kaffe_menu_test_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: local_test_only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
         with:
           distribution: temurin
           java-version: '21'
@@ -31,30 +36,20 @@ jobs:
           server-id: github-kaffe-packages
           server-username: GITHUB_ACTOR
           server-password: GITHUB_TOKEN
-
-      - name: Test and build
-        run: mvn -B verify
+      - run: mvn -B -Dtest=ProductCreationPostgresTest,CatalogCreationPostgresTest,CatalogEditingPostgresTest test
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KAFFE_MENU_TEST_DB: jdbc:postgresql://localhost:5432/kaffe_menu_test_ci
+          KAFFE_MENU_TEST_PASSWORD: local_test_only
 
-      - name: Configure AWS credentials
-        if: github.event_name == 'push'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::514422154879:role/KaffeGitHubActionsDeployRole
-          aws-region: us-east-1
-
-      - name: Login to Amazon ECR
-        if: github.event_name == 'push'
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build and push image
-        if: github.event_name == 'push'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ steps.ecr.outputs.registry }}/kaffe-msa-menu-admin:${{ github.sha }}
-            ${{ steps.ecr.outputs.registry }}/kaffe-msa-menu-admin:${{ github.ref_name }}
+  build:
+    needs: [product-postgres]
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    uses: kguerraxochihua-43/kaffe-platform-infra/.github/workflows/java-service-image.yml@785d5b22027d0f7d935a6104794101391dac4edb
+    with:
+      service_name: menu-admin
+      ecr_repository: kaffe-msa-menu-admin
+      aws_role_arn: arn:aws:iam::514422154879:role/KaffeGitHubActionsDeployRole
