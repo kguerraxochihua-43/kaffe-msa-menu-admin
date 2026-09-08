@@ -42,14 +42,190 @@ jobs:
           KAFFE_MENU_TEST_DB: jdbc:postgresql://localhost:5432/kaffe_menu_test_ci
           KAFFE_MENU_TEST_PASSWORD: local_test_only
 
+  # Equivalent to the pinned shared workflow at 785d5b2. This public repository
+  # cannot call a reusable workflow hosted in the private infrastructure repo.
   build:
     needs: [product-postgres]
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
+    outputs:
+      image_digest: ${{ steps.build-image.outputs.digest }}
     permissions:
       contents: read
       packages: read
       id-token: write
-    uses: kguerraxochihua-43/kaffe-platform-infra/.github/workflows/java-service-image.yml@785d5b22027d0f7d935a6104794101391dac4edb
-    with:
-      service_name: menu-admin
-      ecr_repository: kaffe-msa-menu-admin
-      aws_role_arn: arn:aws:iam::514422154879:role/KaffeGitHubActionsDeployRole
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Java
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          server-id: github-kaffe-packages
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Test and package
+        run: mvn -B verify
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS credentials
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: arn:aws:iam::514422154879:role/KaffeGitHubActionsDeployRole
+          role-session-name: kaffe-menu-admin-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        if: github.event_name == 'push'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2
+
+      - name: Set up Buildx
+        if: github.event_name == 'push'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and publish immutable image
+        if: github.event_name == 'push'
+        id: build-image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/kaffe-msa-menu-admin:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/kaffe-msa-menu-admin:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resolve executable manifest and scan
+        if: github.event_name == 'push'
+        id: scan
+        shell: bash
+        env:
+          AWS_REGION: us-east-1
+          ECR_REPOSITORY: kaffe-msa-menu-admin
+          IMAGE_DIGEST: ${{ steps.build-image.outputs.digest }}
+        run: |
+          set -Eeuo pipefail
+
+          manifest="$(
+            aws ecr batch-get-image \
+              --region "${AWS_REGION}" \
+              --repository-name "${ECR_REPOSITORY}" \
+              --image-ids "imageDigest=${IMAGE_DIGEST}" \
+              --accepted-media-types application/vnd.oci.image.index.v1+json application/vnd.oci.image.manifest.v1+json \
+              --query 'images[0].imageManifest' \
+              --output text
+          )"
+          [[ -n "${manifest}" && "${manifest}" != "None" ]]
+
+          media_type="$(jq -r '.mediaType // empty' <<<"${manifest}")"
+          if [[ "${media_type}" == "application/vnd.oci.image.index.v1+json" ]]; then
+            executable_digest="$(
+              jq -r '
+                .manifests[]
+                | select(.platform.os == "linux" and .platform.architecture == "amd64")
+                | .digest
+              ' <<<"${manifest}" | head -n 1
+            )"
+          else
+            executable_digest="${IMAGE_DIGEST}"
+          fi
+          [[ "${executable_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          start_output="$(
+            aws ecr start-image-scan \
+              --region "${AWS_REGION}" \
+              --repository-name "${ECR_REPOSITORY}" \
+              --image-id "imageDigest=${executable_digest}" \
+              2>&1
+          )" || {
+            if [[ "${start_output}" != *"LimitExceededException"* &&
+                  "${start_output}" != *"ScanAlreadyExistsException"* ]]; then
+              printf '%s\n' "${start_output}" >&2
+              exit 1
+            fi
+          }
+
+          scan_json=""
+          for attempt in $(seq 1 60); do
+            scan_json="$(
+              aws ecr describe-image-scan-findings \
+                --region "${AWS_REGION}" \
+                --repository-name "${ECR_REPOSITORY}" \
+                --image-id "imageDigest=${executable_digest}" \
+                --output json 2>/dev/null || true
+            )"
+            if [[ -z "${scan_json}" ]]; then
+              scan_json="{}"
+            fi
+            status="$(jq -r '.imageScanStatus.status // "PENDING"' <<<"${scan_json}")"
+            case "${status}" in
+              COMPLETE) break ;;
+              FAILED)
+                jq -r '.imageScanStatus.description // "ECR image scan failed"' <<<"${scan_json}" >&2
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+
+          if [[ -z "${scan_json}" ]]; then
+            scan_json="{}"
+          fi
+          status="$(jq -r '.imageScanStatus.status // "UNKNOWN"' <<<"${scan_json}")"
+          [[ "${status}" == "COMPLETE" ]] || {
+            echo "ECR scan did not complete within five minutes" >&2
+            exit 1
+          }
+
+          critical="$(jq -r '.imageScanFindings.findingSeverityCounts.CRITICAL // 0' <<<"${scan_json}")"
+          high="$(jq -r '.imageScanFindings.findingSeverityCounts.HIGH // 0' <<<"${scan_json}")"
+          medium="$(jq -r '.imageScanFindings.findingSeverityCounts.MEDIUM // 0' <<<"${scan_json}")"
+          low="$(jq -r '.imageScanFindings.findingSeverityCounts.LOW // 0' <<<"${scan_json}")"
+
+          {
+            echo "### ECR vulnerability scan"
+            echo
+            echo "| Severity | Findings |"
+            echo "| --- | ---: |"
+            echo "| Critical | ${critical} |"
+            echo "| High | ${high} |"
+            echo "| Medium | ${medium} |"
+            echo "| Low | ${low} |"
+            echo
+            echo "Executable manifest: \`${executable_digest}\`"
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+          (( critical == 0 )) || {
+            echo "Critical vulnerabilities block every branch" >&2
+            exit 1
+          }
+          if [[ "${GITHUB_REF_NAME}" == "prod" ]] && (( high > 0 )); then
+            echo "High vulnerabilities block production" >&2
+            exit 1
+          fi
+          if (( high > 0 )); then
+            echo "::warning title=High image vulnerabilities::${high} high findings must be remediated before production."
+          fi
+
+      - name: Install Cosign
+        if: github.event_name == 'push'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign immutable image
+        if: github.event_name == 'push'
+        env:
+          IMAGE_URI: ${{ steps.ecr.outputs.registry }}/kaffe-msa-menu-admin
+          IMAGE_DIGEST: ${{ steps.build-image.outputs.digest }}
+        run: cosign sign --yes "${IMAGE_URI}@${IMAGE_DIGEST}"
