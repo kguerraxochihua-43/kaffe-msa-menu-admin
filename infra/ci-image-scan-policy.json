@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ScanOnlyMenuAdminImages",
+      "Effect": "Allow",
+      "Action": ["ecr:StartImageScan", "ecr:DescribeImageScanFindings"],
+      "Resource": "arn:aws:ecr:us-east-1:514422154879:repository/kaffe-msa-menu-admin"
+    }
+  ]
+}
