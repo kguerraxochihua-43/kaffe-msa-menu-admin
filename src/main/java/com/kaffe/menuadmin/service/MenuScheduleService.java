@@ -310,27 +310,27 @@ public class MenuScheduleService {
                 locationId);
 
         List<MenuScheduleDtos.Window> windows = jdbcTemplate.query("""
-                        select window.menu_schedule_window_id,
-                               window.menu_id,
+                        select scheduled.menu_schedule_window_id,
+                               scheduled.menu_id,
                                candidate.name as menu_name,
-                               window.day_of_week,
-                               window.starts_at,
-                               window.ends_at,
-                               window.valid_from,
-                               window.valid_to,
-                               window.is_override,
-                               window.is_active,
-                               window.version,
-                               window.created_at,
-                               window.updated_at
-                          from menu.menu_schedule_windows window
+                               scheduled.day_of_week,
+                               scheduled.starts_at,
+                               scheduled.ends_at,
+                               scheduled.valid_from,
+                               scheduled.valid_to,
+                               scheduled.is_override,
+                               scheduled.is_active,
+                               scheduled.version,
+                               scheduled.created_at,
+                               scheduled.updated_at
+                          from menu.menu_schedule_windows scheduled
                           join menu.menus candidate
-                            on candidate.tenant_id = window.tenant_id
-                           and candidate.menu_id = window.menu_id
-                         where window.tenant_id = ?
-                           and window.location_id = ?
-                           and window.deleted_at is null
-                         order by window.day_of_week, window.starts_at, candidate.name
+                            on candidate.tenant_id = scheduled.tenant_id
+                           and candidate.menu_id = scheduled.menu_id
+                         where scheduled.tenant_id = ?
+                           and scheduled.location_id = ?
+                           and scheduled.deleted_at is null
+                         order by scheduled.day_of_week, scheduled.starts_at, candidate.name
                         """,
                 (rs, rowNum) -> new MenuScheduleDtos.Window(
                         rs.getLong("menu_schedule_window_id"),
