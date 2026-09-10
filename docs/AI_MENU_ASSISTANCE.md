@@ -70,6 +70,9 @@ no constituye garantía de exactitud y siempre se muestra un borrador editable.
   `publication.menuId` identifica el resultado. El estado histórico `published`
   del expediente significa transferido al catálogo, no activado para consumidores.
 - La activación, sucursales y horarios se revisan en la administración existente.
+- Si el nombre del menú ya existe, se solicita renombrar el borrador. Los grupos
+  de opciones con nombre ocupado reciben el nombre del producto y, si hace falta,
+  un número; nunca se reutilizan ni se alteran grupos existentes con otros precios.
 - Clientes anteriores que no envían esa bandera conservan su publicación general.
 - La transacción y el bloqueo del borrador impiden publicaciones duplicadas y
   revierten la creación completa si falla cualquier producto u opción.

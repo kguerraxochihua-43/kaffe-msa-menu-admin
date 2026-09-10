@@ -222,8 +222,17 @@ public class AiMenuDraftService {
                 throw new BadRequestException("Escribe el nombre del nuevo menú antes de guardarlo");
             }
             // New menus are inactive until their locations/schedule are reviewed in the existing editor.
-            separateMenuId = number(menuAdminService.createMenu(cafeteriaId, Map.of(
-                    "name", name, "active", false, "global", true, "categoryIds", List.of())).get("menuId"));
+            Boolean taken = jdbcTemplate.queryForObject("""
+                    select exists(select 1 from menu.menus
+                      where tenant_id = ? and lower(name) = lower(?) and deleted_at is null)
+                    """, Boolean.class, cafeteriaId, name);
+            if (Boolean.TRUE.equals(taken)) throw menuNameTaken();
+            try {
+                separateMenuId = number(menuAdminService.createMenu(cafeteriaId, Map.of(
+                        "name", name, "active", false, "global", true, "categoryIds", List.of())).get("menuId"));
+            } catch (DuplicateKeyException ex) {
+                throw menuNameTaken();
+            }
         }
 
         List<Map<String, Object>> publicationCategories = new ArrayList<>();
@@ -247,10 +256,16 @@ public class AiMenuDraftService {
                 ensureProductNameAvailable(cafeteriaId, categoryId, product.name());
                 List<Long> optionGroupIds = new ArrayList<>();
                 for (var group : product.optionGroups()) {
-                    long groupId = number(menuAdminService.createAddonGroup(cafeteriaId, Map.of(
-                            "name", group.name(), "required", group.required(),
-                            "minSelection", group.minSelection(), "maxSelection", group.maxSelection(),
-                            "active", true, "sortOrder", optionGroupIds.size())).get("addonGroupId"));
+                    long groupId;
+                    try {
+                        groupId = number(menuAdminService.createAddonGroup(cafeteriaId, Map.of(
+                                "name", availableOptionGroupName(cafeteriaId, group.name(), product.name()),
+                                "required", group.required(), "minSelection", group.minSelection(),
+                                "maxSelection", group.maxSelection(), "active", true,
+                                "sortOrder", optionGroupIds.size())).get("addonGroupId"));
+                    } catch (DuplicateKeyException ex) {
+                        throw new ConflictException("Las opciones del catálogo cambiaron. Vuelve a guardar el menú.");
+                    }
                     for (int index = 0; index < group.options().size(); index++) {
                         var option = group.options().get(index);
                         menuAdminService.createAddon(cafeteriaId, groupId, Map.of(
@@ -430,6 +445,32 @@ public class AiMenuDraftService {
                 limit 1
                 """, Long.class, cafeteriaId, name);
         return ids.isEmpty() ? 0 : ids.getFirst();
+    }
+
+    private ConflictException menuNameTaken() {
+        return new ConflictException("Ya tienes un menú con ese nombre. Cambia el nombre del borrador para guardarlo aparte.");
+    }
+
+    private String availableOptionGroupName(long tenantId, String name, String productName) {
+        // Groups have a tenant-wide unique name. Never reuse or overwrite an
+        // existing live group's options: qualify the new name with the product.
+        String base = shortLabel(name + " · " + productName, 90);
+        String candidate = name;
+        for (int attempt = 0; attempt < 1000; attempt++) {
+            Boolean taken = jdbcTemplate.queryForObject("""
+                    select exists(select 1 from menu.lkp_addon_groups
+                      where tenant_id = ? and lower(name) = lower(?))
+                    """, Boolean.class, tenantId, candidate);
+            if (!Boolean.TRUE.equals(taken)) return candidate;
+            candidate = attempt == 0 ? base : base + " (" + (attempt + 1) + ")";
+        }
+        throw new ConflictException("Hay demasiadas opciones con ese nombre. Renombra el grupo en el borrador.");
+    }
+
+    private String shortLabel(String value, int limit) {
+        if (value.length() <= limit) return value;
+        int end = Character.isHighSurrogate(value.charAt(limit - 1)) ? limit - 1 : limit;
+        return value.substring(0, end).stripTrailing();
     }
 
     private void ensureProductNameAvailable(long cafeteriaId, long categoryId, String name) {

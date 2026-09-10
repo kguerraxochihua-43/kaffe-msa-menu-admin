@@ -47,20 +47,34 @@ class AiMenuDraftPostgresTest {
                   tenant_id bigint, name text, deleted_at timestamptz);
                 create table menu.products(product_id bigint generated always as identity primary key,
                   tenant_id bigint, category_id bigint, name text, deleted_at timestamptz);
+                create table menu.menus(menu_id bigint generated always as identity primary key,
+                  tenant_id bigint, name varchar(120), deleted_at timestamptz);
+                create unique index menu_name_unique on menu.menus(tenant_id,lower(name)) where deleted_at is null;
+                create table menu.lkp_addon_groups(addon_group_id bigint generated always as identity primary key,
+                  tenant_id bigint, name varchar(120), unique(tenant_id,name));
                 create table menu.catalog_writes(id bigint generated always as identity primary key, kind text, payload jsonb);
                 insert into menu.categories(tenant_id,name) values(1,'Cafés');
                 insert into menu.products(tenant_id,category_id,name) values(1,1,'Latte');
                 """);
         catalog = mock(MenuAdminService.class);
         when(catalog.requireGlobalMenuWriteAccess(anyLong())).thenReturn(7L);
-        when(catalog.createMenu(anyLong(), anyMap())).thenAnswer(call -> Map.of("menuId", write("menu", call.getArgument(1))));
+        when(catalog.createMenu(anyLong(), anyMap())).thenAnswer(call -> {
+            Map<String,Object> body = call.getArgument(1); write("menu", body);
+            return Map.of("menuId", jdbc.queryForObject("insert into menu.menus(tenant_id,name) values(?,?) returning menu_id",
+                    Long.class, call.getArgument(0), body.get("name")));
+        });
         when(catalog.createCategory(anyLong(), anyMap())).thenAnswer(call -> {
             Map<String,Object> body = call.getArgument(1); write("category", body);
             return Map.of("categoryId", jdbc.queryForObject(
                     "insert into menu.categories(tenant_id,name) values(?,?) returning category_id", Long.class,
                     call.getArgument(0), body.get("name")));
         });
-        when(catalog.createAddonGroup(anyLong(), anyMap())).thenAnswer(call -> Map.of("addonGroupId", write("group", call.getArgument(1))));
+        when(catalog.createAddonGroup(anyLong(), anyMap())).thenAnswer(call -> {
+            Map<String,Object> body = call.getArgument(1); write("group", body);
+            return Map.of("addonGroupId", jdbc.queryForObject(
+                    "insert into menu.lkp_addon_groups(tenant_id,name) values(?,?) returning addon_group_id",
+                    Long.class, call.getArgument(0), body.get("name")));
+        });
         when(catalog.createAddon(anyLong(), anyLong(), anyMap())).thenAnswer(call -> Map.of("addonId", write("option", call.getArgument(2))));
         when(catalog.createProduct(anyLong(), anyMap())).thenAnswer(call -> {
             if (failProduct) throw new BadRequestException("Simulated catalog validation failure");
@@ -119,6 +133,29 @@ class AiMenuDraftPostgresTest {
         failProduct = false;
         tx.execute(s -> service.publish(1L, draft.draftId(), new PublishRequest(0, true)));
         assertThat(count("menu.products")).isEqualTo(2);
+    }
+
+    @Test void repeatedOptionNamesAreIsolatedFromExistingGroupsAndOtherProducts() {
+        jdbc.update("insert into menu.lkp_addon_groups(tenant_id,name) values(1,'Tamaño'),(1,'Tamaño · Latte')");
+        var base = payload();
+        var first = base.categories().getFirst().products().getFirst();
+        var second = new DraftProduct("Espresso", null, 4500, null, 1, false, List.of(), first.optionGroups());
+        var draft = create("groups", "Dos cafés con tamaños");
+        service.update(1L, draft.draftId(), new UpdateRequest(0, new DraftPayload(base.title(), "MXN",
+                List.of(new DraftCategory("Cafés", null, 0, List.of(first, second))), List.of())));
+        tx.execute(s -> service.publish(1L, draft.draftId(), new PublishRequest(1, true)));
+        assertThat(jdbc.queryForList("select name from menu.lkp_addon_groups order by addon_group_id", String.class))
+                .containsExactly("Tamaño", "Tamaño · Latte", "Tamaño · Latte (2)", "Tamaño · Espresso");
+        assertThat(jdbc.queryForObject("select count(*) from menu.catalog_writes where kind='group'", Integer.class)).isEqualTo(2);
+    }
+
+    @Test void duplicateMenuNameRemainsAnEditableDraftInsteadOfAnInternalError() {
+        jdbc.update("insert into menu.menus(tenant_id,name) values(1,'Cafés DE LA TARDE')");
+        var draft = create("name", "Latte 60 pesos");
+        assertThatThrownBy(() -> tx.execute(s -> service.publish(1L, draft.draftId(), new PublishRequest(0, true))))
+                .isInstanceOf(ConflictException.class).hasMessageContaining("nombre del borrador");
+        assertThat(service.get(1L, draft.draftId()).status()).isEqualTo("ready");
+        assertThat(count("menu.catalog_writes")).isZero();
     }
 
     @Test void staleEditsAndRevokedPermissionCannotPublish() {
