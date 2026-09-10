@@ -1,5 +1,7 @@
 package com.kaffe.menuadmin.dto;
 
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
@@ -14,8 +16,12 @@ public final class AiMenuDraftDtos {
             String title,
             String currencyCode,
             List<DraftCategory> categories,
-            List<String> warnings
+            List<String> warnings,
+            String sourceText
     ) {
+        public DraftPayload(String title, String currencyCode, List<DraftCategory> categories, List<String> warnings) {
+            this(title, currencyCode, categories, warnings, null);
+        }
     }
 
     public record DraftCategory(
@@ -29,12 +35,27 @@ public final class AiMenuDraftDtos {
     public record DraftProduct(
             String name,
             String description,
-            int basePriceMinor,
+            @JsonDeserialize(using = MenuMinorAmountDeserializer.class) Integer basePriceMinor,
             String priceText,
             int sortOrder,
             boolean needsReview,
-            List<String> reviewReasons
+            List<String> reviewReasons,
+            List<DraftOptionGroup> optionGroups
     ) {
+        public DraftProduct(String name, String description, Integer basePriceMinor, String priceText,
+                            int sortOrder, boolean needsReview, List<String> reviewReasons) {
+            this(name, description, basePriceMinor, priceText, sortOrder, needsReview, reviewReasons, List.of());
+        }
+    }
+
+    public record DraftOptionGroup(String name, boolean required, int minSelection, int maxSelection,
+                                   List<DraftOption> options) {
+    }
+
+    public record DraftOption(String name, @JsonDeserialize(using = MenuMinorAmountDeserializer.class) Integer priceMinor, boolean isDefault) {
+    }
+
+    public record CreateTextRequest(String idempotencyKey, String text) {
     }
 
     public record UpdateRequest(
@@ -43,7 +64,8 @@ public final class AiMenuDraftDtos {
     ) {
     }
 
-    public record PublishRequest(int expectedVersion) {
+    public record PublishRequest(int expectedVersion, boolean createSeparateMenu) {
+        public PublishRequest(int expectedVersion) { this(expectedVersion, false); }
     }
 
     public record DraftResponse(

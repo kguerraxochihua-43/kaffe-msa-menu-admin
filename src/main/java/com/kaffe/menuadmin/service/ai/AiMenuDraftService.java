@@ -39,7 +39,7 @@ public class AiMenuDraftService {
 
     private static final int MIN_IMAGE_BYTES = 1_024;
     private static final int MAX_IMAGE_BYTES = 5 * 1024 * 1024;
-    private static final String SCHEMA_CODE = "kaffe_menu_photo_v1";
+    private static final String SCHEMA_CODE = "kaffe_menu_assisted_v2";
 
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
@@ -47,6 +47,10 @@ public class AiMenuDraftService {
     private final MenuImportAiProvider provider;
 
     public DraftResponse create(Long cafeteriaId, String idempotencyKey, byte[] bytes) {
+        return create(cafeteriaId, idempotencyKey, bytes, null, null);
+    }
+
+    public DraftResponse create(Long cafeteriaId, String idempotencyKey, byte[] bytes, byte[] audio, String text) {
         long actorUserId = menuAdminService.requireGlobalMenuWriteAccess(cafeteriaId);
         if (!provider.isReady()) {
             throw new BusinessRuleException(
@@ -54,10 +58,18 @@ public class AiMenuDraftService {
             );
         }
         validateIdempotencyKey(idempotencyKey);
-        MenuImageInput image = validateImage(bytes);
+        MenuImageInput image = bytes == null ? null : validateImage(bytes);
+        if (audio != null) MenuAudioInput.validate(audio);
+        String sourceText = text == null ? "" : text.strip();
+        if (sourceText.length() > 12_000 || (image == null && audio == null && sourceText.isEmpty())
+                || (bytes != null && audio != null && (long) bytes.length + audio.length > 5_700_000)) {
+            throw new BadRequestException("Agrega una foto, un dictado o un texto de hasta 12000 caracteres");
+        }
+        String sourceHash = sha256("image=" + (bytes == null ? "" : sha256(bytes))
+                + ";audio=" + (audio == null ? "" : sha256(audio)) + ";text=" + sourceText);
         String idempotencyHash = sha256(idempotencyKey.trim());
         DraftResponse existing = findByIdempotency(actorUserId, idempotencyHash);
-        if (existing != null) return requireCompleted(existing);
+        if (existing != null) return requireSameInput(existing, cafeteriaId, sourceHash);
         enforceRateLimit(actorUserId);
 
         UUID draftId = UUID.randomUUID();
@@ -71,23 +83,30 @@ public class AiMenuDraftService {
                     draftId,
                     cafeteriaId,
                     actorUserId,
-                    sha256(bytes),
+                    sourceHash,
                     idempotencyHash,
                     provider.providerCode(),
                     provider.modelCode(),
                     SCHEMA_CODE);
         } catch (DuplicateKeyException ex) {
             DraftResponse concurrent = findByIdempotency(actorUserId, idempotencyHash);
-            if (concurrent != null) return requireCompleted(concurrent);
+            if (concurrent != null) return requireSameInput(concurrent, cafeteriaId, sourceHash);
             throw ex;
         }
 
         try {
+            if (audio != null) {
+                String transcript = provider.transcribe(audio);
+                sourceText = sourceText.isEmpty() ? transcript : sourceText + "\n\nDictado:\n" + transcript;
+            }
             DraftPayload recognized = provider.extract(
                     image,
+                    sourceText,
                     sha256("kaffe-menu:%d:%d".formatted(cafeteriaId, actorUserId))
             );
-            DraftPayload normalized = AiMenuDraftRules.normalize(recognized);
+            if (recognized == null) throw new MenuImportAiException("No se reconoció un menú");
+            DraftPayload normalized = AiMenuDraftRules.normalize(new DraftPayload(recognized.title(),
+                    recognized.currencyCode(), recognized.categories(), recognized.warnings(), sourceText));
             jdbcTemplate.update("""
                     update menu.ai_menu_import_drafts
                     set status_code = 'ready',
@@ -97,7 +116,7 @@ public class AiMenuDraftService {
                       and status_code = 'processing'
                     """, writeJson(normalized), draftId);
             return get(cafeteriaId, draftId);
-        } catch (MenuImportAiException | BadRequestException ex) {
+        } catch (RuntimeException ex) {
             jdbcTemplate.update("""
                     update menu.ai_menu_import_drafts
                     set status_code = 'failed',
@@ -107,7 +126,7 @@ public class AiMenuDraftService {
                       and status_code = 'processing'
                     """, draftId);
             throw new BusinessRuleException(
-                    "No pudimos leer el menú con suficiente seguridad. Toma otra foto con buena luz."
+                    "No pudimos preparar el borrador. Revisa la foto o el dictado y vuelve a intentar."
             );
         }
     }
@@ -183,8 +202,9 @@ public class AiMenuDraftService {
         if (!"ready".equals(locked.status()) || locked.version() != request.expectedVersion()) {
             throw new ConflictException("El borrador cambió. Actualízalo antes de publicar.");
         }
-        AiMenuDraftRules.requirePublishable(locked.draft());
-        if (!"MXN".equals(locked.draft().currencyCode())) {
+        DraftPayload payload = AiMenuDraftRules.normalize(locked.draft());
+        AiMenuDraftRules.requirePublishable(payload);
+        if (!"MXN".equals(payload.currencyCode())) {
             throw new BadRequestException(
                     "Por ahora sólo se pueden publicar borradores con precios en MXN"
             );
@@ -195,23 +215,50 @@ public class AiMenuDraftService {
                 cafeteriaId.toString()
         );
 
+        Long separateMenuId = null;
+        if (request.createSeparateMenu()) {
+            String name = payload.title();
+            if (name == null || name.isBlank()) {
+                throw new BadRequestException("Escribe el nombre del nuevo menú antes de guardarlo");
+            }
+            // New menus are inactive until their locations/schedule are reviewed in the existing editor.
+            separateMenuId = number(menuAdminService.createMenu(cafeteriaId, Map.of(
+                    "name", name, "active", false, "global", true, "categoryIds", List.of())).get("menuId"));
+        }
+
         List<Map<String, Object>> publicationCategories = new ArrayList<>();
-        for (DraftCategory category : locked.draft().categories()) {
-            long categoryId = findCategoryId(cafeteriaId, category.name());
+        for (DraftCategory category : payload.categories()) {
+            long categoryId = separateMenuId == null ? findCategoryId(cafeteriaId, category.name()) : 0;
             boolean categoryCreated = false;
             if (categoryId == 0) {
-                Map<String, Object> created = menuAdminService.createCategory(cafeteriaId, Map.of(
+                Map<String, Object> categoryRequest = new LinkedHashMap<>(Map.of(
                         "name", category.name(),
                         "description", category.description() == null ? "" : category.description(),
                         "sortOrder", category.sortOrder(),
                         "active", true
                 ));
+                if (separateMenuId != null) categoryRequest.put("menuIds", List.of(separateMenuId));
+                Map<String, Object> created = menuAdminService.createCategory(cafeteriaId, categoryRequest);
                 categoryId = number(created.get("categoryId"));
                 categoryCreated = true;
             }
             List<Long> productIds = new ArrayList<>();
             for (DraftProduct product : category.products()) {
                 ensureProductNameAvailable(cafeteriaId, categoryId, product.name());
+                List<Long> optionGroupIds = new ArrayList<>();
+                for (var group : product.optionGroups()) {
+                    long groupId = number(menuAdminService.createAddonGroup(cafeteriaId, Map.of(
+                            "name", group.name(), "required", group.required(),
+                            "minSelection", group.minSelection(), "maxSelection", group.maxSelection(),
+                            "active", true, "sortOrder", optionGroupIds.size())).get("addonGroupId"));
+                    for (int index = 0; index < group.options().size(); index++) {
+                        var option = group.options().get(index);
+                        menuAdminService.createAddon(cafeteriaId, groupId, Map.of(
+                                "name", option.name(), "price", option.priceMinor(), "isDefault", option.isDefault(),
+                                "sortOrder", index, "active", true));
+                    }
+                    optionGroupIds.add(groupId);
+                }
                 Map<String, Object> created = menuAdminService.createProduct(cafeteriaId, Map.of(
                         "categoryId", categoryId,
                         "name", product.name(),
@@ -219,7 +266,8 @@ public class AiMenuDraftService {
                         "basePrice", product.basePriceMinor(),
                         "featured", false,
                         "available", true,
-                        "sortOrder", product.sortOrder()
+                        "sortOrder", product.sortOrder(),
+                        "addonGroupIds", optionGroupIds
                 ));
                 productIds.add(number(created.get("productId")));
             }
@@ -231,10 +279,14 @@ public class AiMenuDraftService {
             publicationCategories.add(Map.copyOf(result));
         }
         Map<String, Object> publication = new LinkedHashMap<>();
-        publication.put("currencyCode", locked.draft().currencyCode());
+        if (separateMenuId != null) {
+            publication.put("menuId", separateMenuId);
+            publication.put("active", false);
+        }
+        publication.put("currencyCode", payload.currencyCode());
         publication.put("categories", List.copyOf(publicationCategories));
         publication.put("categoryCount", publicationCategories.size());
-        publication.put("productCount", locked.draft().categories().stream()
+        publication.put("productCount", payload.categories().stream()
                 .mapToInt(category -> category.products().size()).sum());
 
         int updated = jdbcTemplate.update("""
@@ -282,14 +334,28 @@ public class AiMenuDraftService {
 
     private DraftResponse requireCompleted(DraftResponse response) {
         if ("processing".equals(response.status())) {
-            throw new ConflictException("La fotografía ya se está procesando");
+            throw new ConflictException("El menú ya se está preparando. Intenta recuperar el borrador en un momento.");
         }
         if ("failed".equals(response.status())) {
             throw new BusinessRuleException(
-                    "No pudimos leer esa fotografía. Toma otra con buena luz."
+                    "No pudimos preparar ese borrador. Vuelve a intentar con la foto, voz o texto."
             );
         }
         return response;
+    }
+
+    private DraftResponse requireSameInput(DraftResponse response, Long cafeteriaId, String sourceHash) {
+        if (response.tenantId() != cafeteriaId) {
+            throw new ConflictException("Esta solicitud pertenece a otro comercio");
+        }
+        Boolean same = jdbcTemplate.queryForObject("""
+                select source_sha256 = ? from menu.ai_menu_import_drafts
+                where tenant_id = ? and ai_menu_import_draft_id = ?
+                """, Boolean.class, sourceHash, cafeteriaId, response.draftId());
+        if (!Boolean.TRUE.equals(same)) {
+            throw new ConflictException("El contenido cambió. Inicia un nuevo borrador para conservar los cambios.");
+        }
+        return requireCompleted(response);
     }
 
     private DraftResponse findByIdempotency(long actorUserId, String idempotencyHash) {
@@ -421,7 +487,12 @@ public class AiMenuDraftService {
 
     private String writeJson(Object value) {
         try {
-            return objectMapper.writeValueAsString(value);
+            String json = objectMapper.writeValueAsString(value);
+            // Leave room for jsonb whitespace; reject before the database size constraint.
+            if (json.getBytes(StandardCharsets.UTF_8).length > 400_000) {
+                throw new BadRequestException("El menú es muy extenso. Divídelo en dos borradores.");
+            }
+            return json;
         } catch (JsonProcessingException ex) {
             throw new IllegalStateException("Unable to encode AI menu draft", ex);
         }

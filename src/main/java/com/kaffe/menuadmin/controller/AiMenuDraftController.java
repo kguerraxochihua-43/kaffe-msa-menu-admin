@@ -5,6 +5,7 @@ import com.kaffe.common.web.ApiResponse;
 import com.kaffe.menuadmin.dto.AiMenuDraftDtos.DraftResponse;
 import com.kaffe.menuadmin.dto.AiMenuDraftDtos.PublishRequest;
 import com.kaffe.menuadmin.dto.AiMenuDraftDtos.UpdateRequest;
+import com.kaffe.menuadmin.dto.AiMenuDraftDtos.CreateTextRequest;
 import com.kaffe.menuadmin.service.ai.AiMenuDraftService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.MediaType;
@@ -35,16 +36,26 @@ public class AiMenuDraftController {
     public ApiResponse<DraftResponse> create(
             @PathVariable Long cafeteriaId,
             @RequestParam String idempotencyKey,
-            @RequestPart("image") MultipartFile image
+            @RequestPart(value = "image", required = false) MultipartFile image,
+            @RequestPart(value = "audio", required = false) MultipartFile audio,
+            @RequestParam(required = false) String text
     ) {
         try {
             return ApiResponse.ok(
                     "Borrador de menú digitalizado",
-                    service.create(cafeteriaId, idempotencyKey, image.getBytes())
+                    service.create(cafeteriaId, idempotencyKey, image == null ? null : image.getBytes(),
+                            audio == null ? null : audio.getBytes(), text)
             );
         } catch (IOException ex) {
-            throw new BadRequestException("No pudimos leer la fotografía enviada");
+            throw new BadRequestException("No pudimos leer el archivo enviado");
         }
+    }
+
+    @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
+    public ApiResponse<DraftResponse> createText(@PathVariable Long cafeteriaId, @RequestBody CreateTextRequest request) {
+        if (request == null) throw new BadRequestException("Escribe el contenido del menú");
+        return ApiResponse.ok("Borrador de menú preparado", service.create(cafeteriaId,
+                request.idempotencyKey(), null, null, request.text()));
     }
 
     @GetMapping
@@ -82,7 +93,7 @@ public class AiMenuDraftController {
             @RequestBody PublishRequest request
     ) {
         return ApiResponse.ok(
-                "Menú publicado",
+                request.createSeparateMenu() ? "Menú guardado e inactivo" : "Menú publicado",
                 service.publish(cafeteriaId, draftId, request)
         );
     }

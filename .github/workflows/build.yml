@@ -36,7 +36,7 @@ jobs:
           server-id: github-kaffe-packages
           server-username: GITHUB_ACTOR
           server-password: GITHUB_TOKEN
-      - run: mvn -B -Dtest=ProductCreationPostgresTest,CatalogCreationPostgresTest,CatalogEditingPostgresTest,MenuSchedulePostgresTest test
+      - run: mvn -B -Dtest=ProductCreationPostgresTest,CatalogCreationPostgresTest,CatalogEditingPostgresTest,MenuSchedulePostgresTest,AiMenuDraftPostgresTest test
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KAFFE_MENU_TEST_DB: jdbc:postgresql://localhost:5432/kaffe_menu_test_ci

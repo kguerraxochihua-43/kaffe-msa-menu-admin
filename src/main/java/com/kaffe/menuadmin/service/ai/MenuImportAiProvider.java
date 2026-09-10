@@ -11,4 +11,12 @@ public interface MenuImportAiProvider {
     String modelCode();
 
     DraftPayload extract(MenuImageInput image, String safetyIdentifier);
+
+    default DraftPayload extract(MenuImageInput image, String text, String safetyIdentifier) {
+        return extract(image, safetyIdentifier);
+    }
+
+    default String transcribe(byte[] audio) {
+        throw new MenuImportAiException("El dictado no está disponible");
+    }
 }

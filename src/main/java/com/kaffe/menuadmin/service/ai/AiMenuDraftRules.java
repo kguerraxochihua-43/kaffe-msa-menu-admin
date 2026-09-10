@@ -4,6 +4,8 @@ import com.kaffe.common.exception.BadRequestException;
 import com.kaffe.menuadmin.dto.AiMenuDraftDtos.DraftCategory;
 import com.kaffe.menuadmin.dto.AiMenuDraftDtos.DraftPayload;
 import com.kaffe.menuadmin.dto.AiMenuDraftDtos.DraftProduct;
+import com.kaffe.menuadmin.dto.AiMenuDraftDtos.DraftOption;
+import com.kaffe.menuadmin.dto.AiMenuDraftDtos.DraftOptionGroup;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -64,10 +66,13 @@ public final class AiMenuDraftRules {
                 if (!productNames.add(productName.toLowerCase(Locale.ROOT))) {
                     throw new BadRequestException("No puede haber productos repetidos dentro de una categoría");
                 }
-                if (rawProduct.basePriceMinor() < 0 || rawProduct.basePriceMinor() > MAX_PRICE_MINOR) {
+                if (rawProduct.basePriceMinor() != null &&
+                        (rawProduct.basePriceMinor() < 0 || rawProduct.basePriceMinor() > MAX_PRICE_MINOR)) {
                     throw new BadRequestException("El precio de un producto está fuera del rango permitido");
                 }
-                List<String> reasons = normalizeStrings(rawProduct.reviewReasons(), 5, 180);
+                List<String> reasons = new ArrayList<>(normalizeStrings(rawProduct.reviewReasons(), 8, 180));
+                if (rawProduct.basePriceMinor() == null) addReason(reasons, "Falta confirmar el precio");
+                List<DraftOptionGroup> groups = normalizeOptions(rawProduct.optionGroups(), reasons);
                 boolean needsReview = rawProduct.needsReview() || !reasons.isEmpty();
                 products.add(new DraftProduct(
                         productName,
@@ -76,7 +81,8 @@ public final class AiMenuDraftRules {
                         optional(rawProduct.priceText(), 40),
                         productIndex,
                         needsReview,
-                        reasons
+                        List.copyOf(reasons),
+                        groups
                 ));
                 productCount++;
             }
@@ -91,11 +97,57 @@ public final class AiMenuDraftRules {
             throw new BadRequestException("El borrador no puede contener más de 400 productos");
         }
         return new DraftPayload(
-                optional(input.title(), 160),
+                optional(input.title(), 120),
                 currency,
                 List.copyOf(categories),
-                normalizeStrings(input.warnings(), 20, 220)
+                normalizeStrings(input.warnings(), 20, 220),
+                optional(input.sourceText(), 25_000)
         );
+    }
+
+    private static List<DraftOptionGroup> normalizeOptions(List<DraftOptionGroup> raw, List<String> reasons) {
+        if (raw == null) return List.of();
+        if (raw.size() > 8) throw new BadRequestException("Un producto puede tener hasta 8 grupos de opciones");
+        Set<String> names = new HashSet<>();
+        List<DraftOptionGroup> result = new ArrayList<>();
+        for (DraftOptionGroup group : raw) {
+            if (group == null) throw new BadRequestException("El grupo de opciones no es válido");
+            String name = required(group.name(), "Cada grupo de opciones necesita un nombre", 100);
+            if (!names.add(name.toLowerCase(Locale.ROOT))) {
+                throw new BadRequestException("Hay grupos de opciones repetidos en un producto");
+            }
+            if (group.options() == null || group.options().isEmpty() || group.options().size() > 30
+                    || group.minSelection() < 0 || group.maxSelection() < 1
+                    || group.minSelection() > group.maxSelection() || group.maxSelection() > group.options().size()
+                    || group.required() != (group.minSelection() > 0)) {
+                throw new BadRequestException("Revisa cuántas opciones se pueden elegir en “" + name + "”");
+            }
+            Set<String> optionNames = new HashSet<>();
+            List<DraftOption> options = new ArrayList<>();
+            int defaults = 0;
+            for (DraftOption option : group.options()) {
+                if (option == null) throw new BadRequestException("Una opción no es válida");
+                String optionName = required(option.name(), "Cada opción necesita un nombre", 120);
+                if (!optionNames.add(optionName.toLowerCase(Locale.ROOT))) {
+                    throw new BadRequestException("Hay opciones repetidas en “" + name + "”");
+                }
+                if (option.priceMinor() != null && (option.priceMinor() < 0 || option.priceMinor() > MAX_PRICE_MINOR)) {
+                    throw new BadRequestException("El precio de una opción está fuera del rango permitido");
+                }
+                if (option.priceMinor() == null) addReason(reasons, "Revisa el precio de las opciones");
+                if (option.isDefault()) defaults++;
+                options.add(new DraftOption(optionName, option.priceMinor(), option.isDefault()));
+            }
+            // Catalog currently supports a single explicitly configured default per group.
+            if (defaults > 1) throw new BadRequestException("Elige sólo una opción habitual por grupo");
+            result.add(new DraftOptionGroup(name, group.required(), group.minSelection(),
+                    group.maxSelection(), List.copyOf(options)));
+        }
+        return List.copyOf(result);
+    }
+
+    private static void addReason(List<String> reasons, String reason) {
+        if (!reasons.contains(reason) && reasons.size() < 8) reasons.add(reason);
     }
 
     public static void requirePublishable(DraftPayload draft) {
